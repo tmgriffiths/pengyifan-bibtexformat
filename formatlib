@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# example script for executing bibtexformat quickly without always having
+# to type in the whole command line and figuring out the needed switches
+
+# $@ represents all parameters as given to the script, so it is possible
+# to add things like "-o outfile.bib"
+
+bibtexformat $@  -s  -labels -pn -f  -format -combine -sort   -abb -abb1
+

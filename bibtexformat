@@ -1,0 +1,3560 @@
+#!/usr/bin/perl -w
+
+####################################################################################################
+#
+# Program:         bibtexformat
+#
+# Function:        Adds the BibTeX labels to a library exported by Endnote or Papers and performs
+#                  several format changes to make it look nicer. It also replaces exported ASCII
+#                  garbage with the correct BibTeX symbols (most German, Danish, French and Spanish
+#                  special characters and all uppercase and lowercase Greek letters). Altogether,
+#                  more than 120 symbols are replaced. Citation labels can be generated following
+#                  certain schemes and the journal titles *reliably* abbreviated. Reliably in this
+#                  case means that the script tells the user if no abbreviation has been found for
+#                  a journal, so the user can correct it. It is also possible to switch between
+#                  different abbreviation styles.
+#
+# Author:          Benjamin Bulheller
+#
+# Website:         www.bulheller.com
+#
+# Mail address:    webmaster.-at-.bulheller.com
+#
+# Version:         $Revision: 4900 $, $Date: 2011-03-09 23:37:00 +0100 (Wed, 09 Mar 2011) $
+#
+# Acknowledgments: Projects like bibtexformat depend on suggestions and contributions from the users.
+#                  Many thanks for such feedback deserve the following:
+#                  Thomas Braun
+#                  F. Fabian Rosales-Ortega
+#                  Tiziano Passerini
+#                  Douglas McKee
+#                  Sean Anderson
+#                  Christophe Dessimoz
+#                  Bjoern Nadrovski
+#
+# Licence:         This program is free software: you can redistribute it and/or modify
+#                  it under the terms of the GNU General Public License as published by
+#                  the Free Software Foundation, either version 3 of the License, or
+#                  (at your option) any later version.
+#
+#                  This program is distributed in the hope that it will be useful,
+#                  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#                  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#                  GNU General Public License for more details.
+#
+#                  You should have received a copy of the GNU General Public License
+#                  along with this program.  If not, see http://www.gnu.org/licenses/.
+#
+####################################################################################################
+
+use strict;                         # always use this!!!
+use FindBin qw/$Bin/;               # set $Bin to the script's directory
+use lib $Bin;                       # add the script's directory to the library path
+use lib "$ENV{HOME}/bin/perllib";   # add ~/bin/perllib to the library path
+use Data::Dumper;                   # for printing arrays and hashes
+use GetParameters;                  # to handle command line parameters
+use ParseBibTeX;                    # returns a BibTeX library fully parsed
+use DebugPrint;                     # handy for printing variables during debgging
+use File::Copy;                     # for a backup copy of the original library
+use File::Spec;                     # for concatenating paths OS independently
+
+$Data::Dumper::Sortkeys = 1;        # sort the hash keys when using print Dumper %Hash
+
+# initialize the configuration variables that may be read in via a configuration file
+my ($NewLines, $LeadingBlanks, $EqualPosition, $LabelSeparator, @AbbFiles);
+my ($BackupLibrary, $Substitutions, $AuthorNames);
+my ($ShowSum, $FileURL, $LocalURL, $FileDir);
+
+# obsolete, kept for backward-compatibility
+my ($PapURL, $JabURL);
+
+my (@TypeConversions, @AOPFix, %IgnoreFields, @IgnoreItems);
+
+our $ERROR  = "\nERROR (bibtexformat)";
+
+####################################################################################################
+# Configuration Variables
+####################################################################################################
+
+# the path to the script, its libraries, configuration file, etc.
+my $ScriptLocation = "$ENV{HOME}/bin/bibtexformat";
+
+# all configuration variables should be changed in the file defined here
+my $Configuration = "$ScriptLocation/configuration.cfg";
+
+
+# --------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
+# Nothing should need to be changed below this line, otherwise let the author know
+# --------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
+
+# -conf => $ScriptLocation?
+# -protitle into field content instead of ParseTitle
+
+# Manual:
+# - Last brace always on single line
+# - section on Papers-related problems (quick'n'dirty for the lazy)
+# - url field blanks => %20, use book instead
+
+
+####################################################################################################
+# Initialize the configuration variables
+####################################################################################################
+
+# DO NOT CHANGE THE VARIABLES HERE, USE THE CONFIGURATION FILES INSTEAD!
+
+# All variables needed in the program are set here to a default value (the author's favorite ones
+# of course). These settings may be overridden later on by the configuration file defined above in
+# $Configuration or even by a file provided via the -conf option
+$NewLines       =  2;    # default number of lines between two BibTeX items
+$LeadingBlanks  =  3;    # default number of blanks before a field descriptor
+$EqualPosition  = 15;    # default position of the equal sign starting at first letter of field descriptor
+$LabelSeparator = ":";   # default separator for the cite keys (e.g. Author:Year:Page)
+
+# Papers and JabRef use different local URL formats to link to PDFs. The following variables define
+# what has to be done to convert between the file paths, that is to convert from Paper to JabRef
+# the RegEx s/$LocalURL/$FileURL/ will be executed.
+$LocalURL = "file://localhost/Volumes/Home/username/";
+$FileURL  = "/Users/username/";
+
+# backup the library file in case the input file is to be overwritten (without -o outfile)
+$BackupLibrary  = 1;
+
+# items to be ignored if -s switch is given
+%IgnoreFields = (
+	general => [ qw/Note Abstract Keywords month uri owner timestamp label date-modified
+                    adsnote adsurl priority posted-at sn tc ut citeulike-article-id isbn
+                    doi domains location read rating annote pmid date-added Pii language
+                    affiliation local-url url/ ],
+);
+
+# default list with journal abbreviations, more than one can be added, separated by commas
+@AbbFiles = ("$ScriptLocation/chemical_2007.txt",
+             "$ScriptLocation/abbreviations.cfg");
+
+# A user defined list with regular expressions, which are executed on each line of the library.
+# This is to do serve user-specific needs, e.g. nPi* => $n \rightarrow \pi^*$
+$Substitutions = "$ScriptLocation/substitutions.cfg";
+
+# A list of author names, which have been exported by Papers in the wrong way and have to be corrected, e.g
+# J C Johnson Jr => Johnson, Jr, J C
+# Ludwig van Beethoven => van Beethoven, Ludwig
+$AuthorNames   = "$ScriptLocation/authors.cfg";
+
+# shows the absolute sum of occurrences of journals and authors when using -autlist and -joulist
+$ShowSum = 0;
+
+# Absolute or relative path to the directory containing files linked to in the file and/or local-url fields.
+# -filecheck adds this value before the path given in the file and local-url fields.
+$FileDir = "";
+
+
+####################################################################################################
+# Parameter Configuration
+####################################################################################################
+
+my $Parameters = {
+	o          => "string",       # output file
+	s          => "switch",       # short library, remove fields defined in %IgnoreFields
+	format     => "switch",       # reformat the library
+	nl         => "integer",      # new line in between entries
+	lb         => "integer",      # leading blanks (i.e. indentation for reformatting)
+	ep         => "integer",      # position of the equal sign for reformatting
+	combine    => "switch",       # combine multi-line entries in one line
+	wrap       => "integer",      # wrap lines in the library at a certain column
+	
+	lc         => "switch",       # switch case of types and field keywords to lowercase
+	uc         => "switch",       # switch case of types and field keywords to uppercase
+	sort       => "switch",       # sort the library according to the cite keys
+	
+	abb        => "list",       # define an additional abbreviation file
+	abb1       => "switch",     # use abbreviation 1
+	abb2       => "switch",     # use abbreviation 2
+	full       => "switch",     # use full journal name
+	
+	labels     => "switch",     # create the cite keys
+	sep        => "string",     # the separator used in cute keys
+	pn         => "switch",     # use the page number in the cite keys
+	fy         => "switch",     # use the full year in cite keys instead of just two digits
+	f          => "switch",     # force the cite key generation, overwrite preexisting ones
+	fpapers    => "switch",     # force to overwrite Papers default keys only
+	
+	rangefix   => "switch",     # expand page ranges
+	typereset  => "switch",     # change all entry types to @article
+	typefix    => "switch",     # substitutions of reference types
+	typecheck  => "switch",     # check the required and optional fields of the reference types
+	autfix     => "switch",     # substitutions of the author names
+	autcheck   => "switch",     # check the author name format and display warnings
+	protitle   => "switch",     # protect the title using an additional brace level
+	autmax     => "integer",    # limit the number of authors to a certain number
+	defsubst   => "switch",     # perform default substitutions of symbols and special characters
+	subst      => "switch",     # perform user-defined substitutions
+	
+	autlist    => "switch",     # display the list of authors
+	typelist   => "switch",     # display the list of reference types
+	joulist    => "switch",     # display the list of journals
+	
+	local2file => "switch",     # convert file links to 'file' entries
+	file2local => "switch",     # convert file links to 'local-url' entries
+	filecheck  => "switch",     # check that all referenced files exist
+	filedir    => "string",     # directory where the files are located
+	
+	fileregex  => "stringlist", # use regular expressions on entries in file fields
+	fieldregex => "stringlist", # use regular expressions on particular fields
+	
+	quotes     => "switch",     # convert field delimiters to "quotes"
+	braces     => "switch",     # convert field delimiters to {braces}
+	
+	aopfix     => "switch",     # fix ahead-of-print publications without page numbers
+	
+	conf       => "string",     # use a different configuration file
+	
+	new        => "switch",     # shortcut for the shortcut -o .new
+	log        => "switch",     # write to .log instead of STDOUT
+	
+	# old parameters kept for backwards compatibility
+	jabpdf     => "switch",     # renamed to local2file
+	pappdf     => "switch",     # renamed to file2local
+};
+
+# define the default values
+our $Options = {
+	nl  => $NewLines,
+	lb  => $LeadingBlanks,
+	ep  => $EqualPosition,
+	sep => $LabelSeparator,
+};
+
+my $Help = "\n" .
+   "bibtexformat - automated substitutions and format changes of BibTeX library files\n" .
+   "\n" .
+   '$Revision: 4900 $' . "\n" .
+   '$Date: 2011-03-09 23:37:00 +0100 (Wed, 09 Mar 2011) $' . "\n" .
+   "\n" .
+   "Generates and adds the labels (cite keys) to a BibTeX library file, abbreviates journal\n" .
+   "titles, filters out unneeded items, performs string replacements and checks author names\n" .
+   "for format errors that may lead to incorrect citations.\n" .
+   "\n" .
+   "Usage:   bibtexformat  infile(s)  [options]  [-o outfile]\n" .
+   "\n" .
+   "   -o           Define an output file (recommended).\n" .
+   "                A leading dot defines an extension squeezed between the original extension\n" .
+   "                and the filename (e.g. -o .new => Library.new.bib, as shortcut and needed\n" .
+   "                for multiple file processing)\n " .
+   "\n" .
+   "   -s           short library, leaves out abstract, keywords, etc. (see configuration file)\n" .
+   "\n" .
+   "   -labels      create the labels (cite keys) for items without one\n" .
+   "      -pn          use the first page number to create unambiguous labels of the type\n" .
+   "                   Author:Year:Page\n" .
+   "      -fy          use the full year instead of only the last two digits (mind that it may\n" .
+   "                   not always be given)\n" .
+   "      -sep         define the separator for the labels (default is \":\")\n" .
+   "      -f           force the generation of labels, even if already defined\n" .
+   "                   (this overwrites all existing labels)\n" .
+   "      -fpapers     force the generation of labels for items with a Papers default label\n" .
+   "                   (Author:2000p1234) while keeping all other preexisting ones\n" .
+   "\n" .
+   "   -rangefix    expand page numbers, e.g. 723-7 to 723-727\n" .
+   "   -protitle    protect the case of the title by enclosing it with double braces {{ }}\n" .
+   "\n" .
+   "   -typecheck   check all items for mandatory fields of the respective BibTeX type\n" .
+   "   -typereset   change all entry types to \@article (for an export by Papers)\n" .
+   "   -typefix     change BibTeX types depending on certain trigger words\n" .
+	"                (requires configuration in $Configuration)\n" .
+   "\n" .
+   "   -aopfix      correct ahead-of-print publications without page numbers by using the DOI instead\n" .
+	"                (requires configuration in $Configuration)\n" .
+   "\n" .
+   "   -autcheck    check the authors for correct division into first, last, von and Jr part\n" .
+   "   -autfix      perform the user-defined corrections of author names\n" .
+   "   -autmax      define a maximum number of authors before the list is shortened to et al.\n" .
+   "\n" .
+   "   -autlist     print the number and a list of all authors\n" .
+   "   -joulist     print the number and a list of all journals\n" .
+   "   -typelist    print a list of all found BibTeX types\n" .
+   "\n" .
+   "   -defsubst    perform the default substitutions in the titles\n" .
+   "   -subst       perform user-defined substitutions in the titles\n" .
+   "\n" .
+   "   -fieldregex  uses a regular expression on particular fields:\n" .
+   "                -fieldregex fieldname \"from\" \"to\" fieldname \"from\" \"to\" [...]\n" .
+   "\n" .
+   "   -fileregex   uses a number of regular expressions on each file in the 'file' fields:\n" .
+   "                -fileregex \"from1\" \"to1\" \"from2\" \"to2\" [...]\n\n" .
+   "                \"^\" matches the beginning of the filenames\n" .
+   "                \"\"  to replace something with an empty string\n" .
+   "\n" .
+   "   -sort        sort the items alphabetically according to their BibTeX label\n" .
+   "   -nl          newlines between BibTeX items, default is $Options->{nl}\n" .
+   "\n" .
+   "   -quotes      convert the field delimiters to quotes\n" .
+   "   -braces      convert the field delimiters to braces\n" .
+   "\n" .
+   "   -format      re-format the library to improve readability\n" .
+   "      -lb          leading blanks before a field descriptor, default is $Options->{lb}\n" .
+   "      -ep          position of equal signs (including leading blanks), default is $Options->{ep}\n" .
+   "      -lc          format field keywords (\"author\") and reference types (\"\@book\") lowercase\n" .
+   "      -uc          format field keywords (\"author\") and reference types (\"\@book\") uppercase\n" .
+   "      -combine     combine multiline entries in one line\n" .
+   "      -wrap 80     wraps the line at, for example, column 80 (indentation is considered)\n" .
+   "\n" .
+   "   -abb         abbreviate the journal titles, one or more files containing the abbreviations\n" .
+   "                can be given and also defined by default in the script\n" .
+   "   -abb1        use the first abbreviation given in the abbreviation files (default)\n" .
+   "   -abb2        use the second abbreviation given in the abbreviation files\n" .
+   "                (usually without periods)\n" .
+   "   -full        use the full journal title and replace all abbreviated titles with it\n" .
+   "\n" .
+   "   -local2file  convert all file links from 'local-url' to 'file' entries (e.g. JabRef)\n" .
+   "   -file2local  convert all file links from 'file' to 'local-url' entries (e.g. Papers)\n" .
+   "   -filecheck   check the existence of all referenced files (file =)\n" .
+   "   -filedir     base directory of the files for -filecheck\n" .
+   "\n" .
+   "   -conf        read in a configuration file different from the one defined in the source\n" .
+   "   -log         write all output to .log instead of STDOUT/STDERR.\n" .
+   "\n" .
+   "\n" .
+   "Important information for the label generation using -labels:\n" .
+   "        If -pn is omitted, then the labels are generated using the first author, a colon,\n" .
+   "        the year (two digits) and a lowercase letter to avoid duplicates, e.g.\n" .
+   "           Author:99\n" .
+   "           Author:03a\n" .
+   "           Author:03b\n" .
+   "\n" .
+   "        If :03 exists and a second match is found, then the first one is renamed :03a\n" .
+   "        and the second becomes :03b.\n" .
+   "        In order to always have the labels of an Endnote library assigned in the same \n" .
+   "        sequence, even if new references are added and the library is exported again, it\n" .
+   "        is IMPORTANT that the Endnote library is sorted according to the record numbers!\n" .
+   "        Generally, using the page number is strongly recommended (-pn option).\n" .
+   "\n";
+
+####################################################################################################
+
+# Definition of required and optional fields for the Reference types
+my $RefTypes = {
+	article       => { Req => [ qw/author title journal year/ ],
+	                   Opt => [ qw/volume number pages month note/ ] },
+	book          => { Req => [ qw/author-or-editor title publisher year/ ],
+	                   Opt => [ qw/volume-or-number series address edition month note/ ] },
+	booklet       => { Req => [ qw/title/ ],
+	                   Opt => [ qw/author howpublished address month year note/ ], },
+	conference    => { Req => [ qw/author title booktitle year/ ],
+	                   Opt => [ qw/editor volume-or-number series pages address month organization publisher/ ], },
+	inbook        => { Req => [ qw/author-or-editor title chapter-andor-pages publisher year/ ],
+	                   Opt => [ qw/volume-or-number series type address edition month note/ ], },
+	incollection  => { Req => [ qw/author title booktitle publisher year/ ],
+	                   Opt => [ qw/editor volume-or-number series type chapter pages address edition month note/ ], },
+	inproceedings => { Req => [ qw/author title booktitle year/ ],
+	                   Opt => [ qw/editor volume-or-number series pages address month organization publisher/ ], },
+	manual        => { Req => [ qw/title/ ],
+	                   Opt => [ qw/author organization address edition month year note/ ], },
+	mastersthesis => { Req => [ qw/author title school year/ ],
+	                   Opt => [ qw/type address month note/ ], },
+	misc          => { Req => [ qw// ],
+	                   Opt => [ qw/author title howpublished month year note/ ], },
+	phdthesis     => { Req => [ qw/author title school year/ ],
+	                   Opt => [ qw/type address month note/ ], },
+	proceedings   => { Req => [ qw/title year/ ],
+	                   Opt => [ qw/editor volume-or-number series address month organization publisher note/ ], },
+	techreport    => { Req => [ qw/author title institution year/ ],
+	                   Opt => [ qw/type number address month note/ ], },
+	unpublished   => { Req => [ qw/author title note/ ],
+	                   Opt => [ qw/month year/ ], },
+};
+
+####################################################################################################
+
+# parse the command line parameters and sort them into the $Options array
+GetParameters ($Parameters, $Options, $Help);
+
+my ($InFile, $Content, $MultipleFiles, $Line, $Item, @Fields);
+
+# this is the configuration file defined at the beginning of the code.
+&ReadConfigurationFile;
+
+####################################################################################################
+
+# check whether an input file was given
+if (not defined $Options->{rest}) {
+	&Output ("STDERR", "$ERROR: No input file(s) given!\n$Help");
+	exit 1;
+}
+
+if ($Options->{combine} and $Options->{wrap}) {
+	&Output ("STDERR", "\nBoth the -combine and the -wrap option were given. This is slightly "
+	                 . "schizophrenic... ;-)\n"
+	                 . "Doesn't hurt, though, the wrapping is done last and -combine, therefore, "
+	                 . "ignored,\n\n");
+}
+
+if ($Options->{o} and $Options->{new}) {
+	&Output ("STDERR", "$ERROR: Either -new or -o may be given.\n\n");
+	exit 3;
+}
+
+if ($Options->{quotes} and $Options->{braces}) {
+	&Output ("STDERR", "$ERROR: Either -quotes or -braces may be requested.\n\n");
+	exit 5;
+}
+
+####################################################################################################
+
+# translate some obsolete parameters that were kept for backward-compatibility
+
+if ($Options->{jabpdf}) { # -jabpdf option was renamed to -local2file
+	$Options->{local2file} = $Options->{jabpdf};
+	delete $Options->{jabpdf};
+}
+
+if ($PapURL) { # $PapURL was renamed to LocalURL
+	$LocalURL = $PapURL;
+	$PapURL = undef;
+}
+
+if ($Options->{pappdf}) { # -pdppdf was renamed to -file2local
+	$Options->{file2local} = $Options->{pappdf};
+	delete $Options->{pappdf};
+}
+
+if ($JabURL) { # $JabURL was renamed to $FileURL
+	$FileURL = $JabURL;
+	$JabURL = undef;
+}
+
+####################################################################################################
+
+if ($Options->{abb} or $Options->{full} or $Options->{abb1} or $Options->{abb2}) {
+	# Add the default files to the ones given via the command line. The default ones are added to
+	# the end of the list, that is the ones given by the user are searched first
+	push @{$Options->{abb}}, @AbbFiles;
+}
+
+# the statistics are taken of all processed files (if multiple ones are processed)
+my $Statistics = {};  # create a hash reference for some statistics
+
+if (scalar @{$Options->{rest}} > 1) {
+	if ($Options->{o} and $Options->{o} !~ m/^\./) {
+		my $Count = scalar @{$Options->{rest}};
+		
+		print "\n";
+		print "$ERROR:  $Count files are processed but a single output file is given ($Options->{o}).\n";
+		print "        You can define a new, secondary extension by a leading dot, e.g. .new for that.\n";
+		exit 7;
+	}
+	$MultipleFiles = 1;
+}
+else {
+	$MultipleFiles = 0;
+}
+
+####################################################################################################
+
+while ( @{$Options->{rest}} ) { # process all input file
+	my $Library    = [];  # create a new array reference for the BibTeX items for each processed library
+	my ($OutputMessage, $InBaseName, $OutBaseName, $DotPosition, $Extension);
+	
+	$InFile = shift @{$Options->{rest}};
+	
+	# check for the existence of the given file, and try the .bib extension
+	if (not -f $InFile) {
+		if (-f "$InFile.bib") { $InFile = "$InFile.bib"; }
+		else {
+			&Output ("STDERR", "$ERROR: Library database $InFile not found!\n\n");
+			exit 10;
+		}
+	}
+	
+	# determine the base name of the output file and the log file (if necessary)
+	# separate path, file name and extension
+	$DotPosition = rindex ($InFile, "."); # determine the position of the last dot
+	
+	if ($DotPosition != -1) { # if a dot was found, copy and remove the extension
+		$InBaseName  = $InFile;                          # copy the input filename
+		$Extension   = substr ($InFile, $DotPosition);   # take everything after the last dot
+		$InBaseName  =~ s/$Extension$//;                 # remove the extension
+	}
+	else { # if no dot was found, there is no extension
+		$InBaseName  = $InFile;
+		$Extension = "";
+	}
+	
+	# the -new option is just a shortcut for -o .new (lazyness of the author who needed that very regularly)
+	if ($Options->{new}) { $Options->{o} = ".new"; }
+	
+	# check whether an output file was defined or take the input filename
+	if ($Options->{o}) {                     # if an output file was given
+		if ($Options->{o} =~ m/^\./) {        # if the output filename starts with a dot (e.g. .new)
+			my $Temp = $Options->{o};          # save the secondary extension
+			$Temp =~ s/\.$//;                  # remove a potentially trailing dot
+			$Options->{o} = $InBaseName . $Temp . $Extension; # add it before the extension, e.g. .new.bib
+			$OutBaseName  = $InBaseName . $Temp;
+		}
+		else { # if the output file does not start with a dot
+			$OutBaseName = $Options->{o};
+			
+			$DotPosition = rindex ($OutBaseName, "."); # determine the position of the last dot
+			
+			if ($DotPosition != -1) { # if a dot was found, copy and remove the extension
+				$Extension   = substr ($OutBaseName, $DotPosition); # take everything after the last dot
+				$OutBaseName =~ s/$Extension$//;                    # remove the extension
+			}
+			else { # if no dot was found, there is no extension and .bib is used
+				$OutBaseName  = $Options->{o};
+				$Extension    = ".bib";
+			}
+		}
+		
+		$OutputMessage = "(new file)";
+	}
+	else { # if no output file was given
+		if ($Extension) { # if there was an extension
+			$Options->{o} = $InBaseName . $Extension;
+		}
+		else {
+			$Options->{o} = $InBaseName . ".new";
+		}
+		
+		if ($BackupLibrary) { # whether a backup is to be created if the input file is overwritten
+			my $Backup = $InBaseName;
+			
+			$Backup = $InBaseName . ".old" . $Extension;
+			copy $InFile, $Backup;
+			$OutputMessage = "(overwriting input file, backup saved to $Backup)";
+		}
+		else { # if no backup is to be created
+			$OutputMessage = "(overwriting input file)";
+		}
+	}
+	
+	if ($Options->{log}) {
+		$Options->{log} = $OutBaseName . ".log";
+		open  LOG, ">$Options->{log}" or die "$ERROR: Could not open logfile $Options->{log}: $!";
+		close LOG;
+	}
+	
+	# die "\nInBaseName:  $InBaseName\nOutBaseName: $OutBaseName\nOutFile:     $Options->{o}\nLogFile:     $Options->{log}\n\n";
+	
+	$Line = "\n Processing library $InFile\n ";
+	for (5 .. length $Line) { $Line = $Line . "=" }   # add the line to underline the heading
+	$Line = $Line . "\n\n";
+	
+	&Output ($Line);
+	
+	# read the complete input file into $Content
+	open FILE, "<$InFile";
+	@{$Content} = <FILE>;
+	close FILE;
+	
+	if (not @{$Content} ) {
+		&Output ("STDERR", "$ERROR: The file $InFile appears to be empty!\n\n");
+		exit 15;
+	}
+	
+	&TaskHeader ("Parsing library\n");
+	
+	# check each line for necessary substitutions
+	&ReplaceSymbols ($Content, $Substitutions);
+	
+	# creates an array with one item for each BibTeX item
+	ParseBibTeX ($Library, $Content);
+	# dp $Library;
+	
+	# perform the corrections defined in the "authors" file or shorten the list to a defined number
+	if ($Options->{autfix} or $Options->{autmax}) {
+		&AuthorCorrections ($Library);
+	}
+	
+	# expand abbreviated page ranges
+	if ($Options->{rangefix}) {
+		&RangeCorrection ($Library);
+	}
+	
+	# protect the title from case changes by BibTeX (by enclosing it in {...})
+	if ($Options->{protitle}) {
+		&ProtectTitle ($Library);
+	}
+	
+	# change all reference types to @article
+	if ($Options->{typereset}) {
+		&TypeReset ($Library);
+	}
+	
+	# replace reference types in a Paper export
+	if ($Options->{typefix}) {
+		&TypeConversion ($Library);
+	}
+	
+	# abbreviate the journal titles (should happen after TypeConversion)
+	if ($Options->{full} or $Options->{abb1} or $Options->{abb2}) {
+		&AbbreviateJournals ($Library, $Options->{abb});
+	}
+	
+	# create the label (cite key) for each item (has to happen after TypeConversion)
+	if ($Options->{labels}) {
+		&CreateLabels ($Library);
+	}
+	
+	# convert between JabRef (file) and Papers/BibDesk (local-url) format for links to external files
+	if ($Options->{local2file} or $Options->{file2local}) {
+		&LinkConversion ($Library);
+	}
+	
+	# to perform regular expressions on particular fields
+	if ($Options->{fieldregex}) {
+		&FieldRegEx ($Library);
+	}
+	
+	# to perform regular expressions on each entry in a "file" field
+	if ($Options->{fileregex}) {
+		&FileRegEx ($Library);
+	}
+	
+	# check if all files exist
+	if ($Options->{filecheck}) {
+		&FileCheck ($Library);
+	}
+	
+	# if no pages entry but a doi is present, use the doi value as "pages"-entry
+	if ($Options->{aopfix}) {
+		&AOPFix ($Library);
+	}
+	
+	# remove unwanted fields defined in %IgnoreFields in the configuration file
+	# (this has to happen after TypeConversion!)
+	if ($Options->{s}) {
+		&ShortenLibrary ($Library);
+	}
+	
+	# reformat the entries (align equal signs, etc.)
+	if ($Options->{format}) {
+		&FormatLibrary ($Library);
+	}
+	
+	# check whether mandatory fields for each BibTeX entry are present
+	if ($Options->{typecheck}) {
+		&CheckTypes ($Library);
+	}
+
+	if ($Options->{quotes} or $Options->{braces}) {
+		&ConvertDelimiters ($Library);
+	}
+	
+	# if any list is requested, collect all data of this library
+	if ($Options->{autlist} or $Options->{autcheck} or $Options->{joulist} or $Options->{typelist}) {
+		&CreateStatistics ($Library, $Statistics);
+	}
+	
+#	dp ($Library);
+#	dp ($Library, $Statistics);
+	
+	# check for double labels or entries without labels
+	my (@NoLabel, @DoubleLabel);
+	my $Labels = {};
+	foreach $Item ( @{$Library} ) {
+		if ($Item->{Label} and defined $Labels->{$Item->{Label}}) {
+			push @DoubleLabel, $Item->{Label};
+		}
+		
+		if (not $Item->{Label} and $Item->{RefType} !~ m/string/i and $Item->{RefType} !~ m/comment/i) {
+			push @NoLabel, &RefSummary ($Item);
+		}
+		
+		if ($Item->{Label}) {
+			$Labels->{$Item->{Label}} = 1;
+		}
+	} # of foreach $Item
+	
+	if (@DoubleLabel) {
+		&Output ("    WARNING: One or more labels have been found more than once.");
+		if ($Options->{sort}) { &Output (" Sorting disabled.\n    "); }
+		                 else { &Output ("\n    ");                   }
+		&Output ( join ("      ", @DoubleLabel), "\n\n    ");
+		$Options->{sort} = 0;
+	}
+	
+	if (@NoLabel) {
+		&Output ("    WARNING: No label defined for the entries below.");
+		if ($Options->{sort}) { &Output (" Sorting disabled.\n"); }
+		                 else { &Output ("\n");                   }
+		&Output ( join ("", @NoLabel), "\n\n");
+		$Options->{sort} = 0;
+	}
+	
+	if ($Options->{sort}) {
+		$Library = &SortLibrary ($Library);   # sort the library alphabetically after the cite keys
+	}
+	
+	# save the result to the output file
+	&TaskHeader ("Writing library to $Options->{o} $OutputMessage\n");
+	
+	WriteBibTeX ($Library, $Options->{o}, $Options->{nl});
+} # of while ( @{$Options->{rest}} ) { # process all input files
+
+if ($MultipleFiles) { &Output ("\n\nCombined results from all processed libraries:\n\n") }
+
+if ($Options->{autlist}) {
+	# print out a list of all authors
+	&PrintAuthorList ($Statistics);
+}
+
+if ($Options->{joulist}) {
+	# print out a list of all journals
+	&PrintJournalList ($Statistics);
+}
+
+if ($Options->{typelist}) {
+	# print out a list of all journals
+	&PrintTypeList ($Statistics);
+}
+
+if ($Options->{autcheck}) {
+	# check the list of authors, whether the different parts (first, last, von, Jr) are separated correctly
+	&CheckAuthors ($Statistics, $AuthorNames);
+}
+
+# just a good-bye message
+&SmallHeader ("Done!\n\n");
+
+
+#######################################################################################################################
+#######################################################################################################################
+# S U B R O U T I N E S
+#######################################################################################################################
+#######################################################################################################################
+
+sub ReplaceSymbols { # checks each line for necessary substitutions
+	my $Content       = shift;
+	my $Substitutions = shift;
+	
+	my ($Substitution, @Substitutions, $Line, $Item);
+	
+	&TaskHeader ("Replacing symbols\n");
+	
+	# prepare user-defined substitutions, if given
+		if ($Substitutions and $Options->{subst}) {
+			open SUBSTITUTIONS, "<$Substitutions" or die "$ERROR: Could not open file $Substitutions: $!";
+		@Substitutions = <SUBSTITUTIONS>;
+		close SUBSTITUTIONS;
+	}
+	
+	# check each line for needed replacements (lots of this could be combined but it was kept for readability)
+	foreach $Line ( @{$Content} ) {
+		if ($Options->{defsubst}) {
+			$Line = &PredefinedSubstitutions ($Line);
+		}
+		
+		# Execute user-defined substitutions if given. This is done after all other replacements
+		# have been carried out, that is, all special symbols will already be in LaTeX code.
+		# Each $Substitution is a command such as $Line =~ s/foo/bar/g;
+		if (@Substitutions) {
+			foreach $Substitution ( @Substitutions ) {
+				eval $Substitution;
+			}
+		}
+	}
+} # of sub ReplaceSymbols
+
+
+#######################################################################################################################
+
+
+sub PredefinedSubstitutions {
+	my $Line = shift;
+	
+	# If the line is empty (multiple blanks and a line feed), then it would
+	# be removed by the /\s+/ regex because \s also matched \n.
+	# In order to preserve the line feed, the line is not touched if it
+	# contains only blanks.
+	if ($Line =~ m/^[ ]*\n$/) { return "\n" }
+	
+	$Line =~ s/\n$//;             # remove all newlines
+	$Line =~ s/\r$//;             # remove all DOS linefeeds
+	$Line =~ s/\s+$//;            # remove all trailing blanks
+	
+	$Line =~ s/–/-/g;             # this happens when a hyphen (dash) is in an Endnote field
+	$Line =~ s/Å/\{\\AA\}/g;      # replace Angstrom
+	$Line =~ s/å/\{\\aa\}/g;      # replace angstrom
+	$Line =~ s/([^\\])%/$1\\%/g;  # escape percent signs
+	
+	# $Line =~ s/([^\\])&/$1\\&/g;  # escape ampersands (commented due to problems with math environments in multiple runs)
+	
+	# Escape dollar signs, this is not trivial as it needs to be checked whether this is actually a LaTeX math
+	# delimiter which was added in a previous run. It is only done when a single dollar sign is found as this
+	# cannot be a maths environment then. In all other cases it's left to the user.
+	my $Dollars = ($Line =~ tr/\$/\$/); # count the number of dollar signs in the line
+	if ($Dollars == 1) { $Line =~ s/([^\\])\$/$1\\\$/g; } # only escape the sign if it hasn't been escaped before
+	
+	$Line =~ s/Ǎ/\\v\{A\}/g;      # umlaut caron vA
+	$Line =~ s/ǎ/\\v\{a\}/g;      # umlaut caron va
+	$Line =~ s/Č/\\v\{C\}/g;      # umlaut caron vC
+	$Line =~ s/č/\\v\{c\}/g;      # umlaut caron vc
+	$Line =~ s/Ď/\\v\{D\}/g;      # umlaut caron vD
+	$Line =~ s/Ě/\\v\{E\}/g;      # umlaut caron vE
+	$Line =~ s/ě/\\v\{e\}/g;      # umlaut caron ve
+	$Line =~ s/Ǧ/\\v\{G\}/g;      # umlaut caron vG
+	$Line =~ s/ǧ/\\v\{g\}/g;      # umlaut caron vg
+	$Line =~ s/Ȟ/\\v\{H\}/g;      # umlaut caron vH
+	$Line =~ s/ȟ/\\v\{h\}/g;      # umlaut caron vh
+	$Line =~ s/Ǐ/\\v\{I\}/g;      # umlaut caron vI
+	$Line =~ s/ǐ/\\v\{i\}/g;      # umlaut caron vi
+	$Line =~ s/ǰ/\\v\{j\}/g;      # umlaut caron vj
+	$Line =~ s/Ǩ/\\v\{K\}/g;      # umlaut caron vK
+	$Line =~ s/ǩ/\\v\{k\}/g;      # umlaut caron vk
+	$Line =~ s/Ň/\\v\{N\}/g;      # umlaut caron vN
+	$Line =~ s/ň/\\v\{n\}/g;      # umlaut caron vn
+	$Line =~ s/Ǒ/\\v\{O\}/g;      # umlaut caron vO
+	$Line =~ s/ǒ/\\v\{o\}/g;      # umlaut caron vo
+	$Line =~ s/Ř/\\v\{R\}/g;      # umlaut caron vR
+	$Line =~ s/ř/\\v\{r\}/g;      # umlaut caron vr
+	$Line =~ s/Š/\\v\{S\}/g;      # umlaut caron vS
+	$Line =~ s/š/\\v\{s\}/g;      # umlaut caron vs
+	$Line =~ s/Ť/\\v\{T\}/g;      # umlaut caron vT
+	$Line =~ s/ť/\\v\{t\}/g;      # umlaut caron vt
+	$Line =~ s/Ǔ/\\v\{U\}/g;      # umlaut caron vU
+	$Line =~ s/ǔ/\\v\{u\}/g;      # umlaut caron vu
+	$Line =~ s/Ž/\\v\{Z\}/g;      # umlaut caron vZ
+	$Line =~ s/ž/\\v\{z\}/g;      # umlaut caron vz
+	
+	$Line =~ s/Ä/\\"\{A\}/g;      # umlaut "A
+	$Line =~ s/ä/\\"\{a\}/g;      # umlaut "a
+	$Line =~ s/Ö/\\"\{O\}/g;      # umlaut "O
+	$Line =~ s/ö/\\"\{o\}/g;      # umlaut "o
+	$Line =~ s/Ü/\\"\{U\}/g;      # umlaut "U
+	$Line =~ s/ü/\\"\{u\}/g;      # umlaut "u
+	$Line =~ s/ß/\\ss/g;          # umlaut \ss
+	
+	$Line =~ s/Á/\\'\{A\}/g;      # A accent acute
+	$Line =~ s/á/\\'\{a\}/g;      # a accent acute
+	$Line =~ s/À/\\`\{A\}/g;      # A accent grave
+	$Line =~ s/à/\\`\{a\}/g;      # a accent grave
+	
+	$Line =~ s/É/\\'\{E\}/g;      # E accent acute
+	$Line =~ s/é/\\'\{e\}/g;      # e accent acute
+	$Line =~ s/È/\\`\{E\}/g;      # E accent grave
+	$Line =~ s/è/\\`\{e\}/g;      # e accent grave
+	
+	$Line =~ s/Í/\\'\{I\}/g;      # I accent acute
+	$Line =~ s/í/\\'\{i\}/g;      # i accent acute
+	$Line =~ s/Ì/\\`\{I\}/g;      # I accent grave
+	$Line =~ s/ì/\\`\{i\}/g;      # i accent grave
+	
+	$Line =~ s/Ó/\\'\{O\}/g;      # O accent acute
+	$Line =~ s/ó/\\'\{o\}/g;      # o accent acute
+	$Line =~ s/Ò/\\`\{O\}/g;      # O accent grave
+	$Line =~ s/ò/\\`\{o\}/g;      # o accent grave
+	
+	$Line =~ s/Ú/\\'\{U\}/g;      # U accent acute
+	$Line =~ s/ú/\\'\{u\}/g;      # u accent
+	$Line =~ s/Ù/\\`\{U\}/g;      # U grave
+	$Line =~ s/ù/\\`\{u\}/g;      # u accent grave
+	
+	$Line =~ s/Â/\\^\{A\}/g;      # A circumflex
+	$Line =~ s/â/\\^\{a\}/g;      # a circumflex
+	$Line =~ s/Ê/\\^\{E\}/g;      # E circumflex
+	$Line =~ s/ê/\\^\{e\}/g;      # e circumflex
+	$Line =~ s/Î/\\^\{I\}/g;      # I circumflex
+	$Line =~ s/î/\\^\{i\}/g;      # i circumflex
+	$Line =~ s/Ô/\\^\{O\}/g;      # O circumflex
+	$Line =~ s/ô/\\^\{o\}/g;      # o circumflex
+	$Line =~ s/Û/\\^\{U\}/g;      # U circumflex
+	$Line =~ s/û/\\^\{u\}/g;      # u circumflex
+	
+	$Line =~ s/Ç/\\c\{C\}/g;      # C cedilla
+	$Line =~ s/ç/\\c\{c\}/g;      # c cedilla
+	$Line =~ s/Ø/\\c\{O\}/g;      # O cedilla
+	$Line =~ s/ø/\\c\{o\}/g;      # o cedilla
+	$Line =~ s/Ş/\\c\{S\}/g;      # S sedilla
+	$Line =~ s/ş/\\c\{s\}/g;      # s sedilla
+	
+	$Line =~ s/Ñ/\\~\{N\}/g;      # N tilde
+	$Line =~ s/ñ/\\~\{n\}/g;      # n tilde
+	$Line =~ s/Õ/\\~\{O\}/g;      # O tilde
+	$Line =~ s/õ/\\~\{o\}/g;      # o tilde
+	
+	$Line =~ s/Ǎ/\\v\{A\}/g;      # umlaut caron vA
+	$Line =~ s/ǎ/\\v\{a\}/g;      # umlaut caron va
+	$Line =~ s/Č/\\v\{C\}/g;      # umlaut caron vC
+	$Line =~ s/č/\\v\{c\}/g;      # umlaut caron vc
+	$Line =~ s/Ď/\\v\{D\}/g;      # umlaut caron vD
+	$Line =~ s/Ě/\\v\{E\}/g;      # umlaut caron vE
+	$Line =~ s/ě/\\v\{e\}/g;      # umlaut caron ve
+	$Line =~ s/Ǧ/\\v\{G\}/g;      # umlaut caron vG
+	$Line =~ s/ǧ/\\v\{g\}/g;      # umlaut caron vg
+	$Line =~ s/Ȟ/\\v\{H\}/g;      # umlaut caron vH
+	$Line =~ s/ȟ/\\v\{h\}/g;      # umlaut caron vh
+	$Line =~ s/Ǐ/\\v\{I\}/g;      # umlaut caron vI
+	$Line =~ s/ǐ/\\v\{i\}/g;      # umlaut caron vi
+	$Line =~ s/ǰ/\\v\{j\}/g;      # umlaut caron vj
+	$Line =~ s/Ǩ/\\v\{K\}/g;      # umlaut caron vK
+	$Line =~ s/ǩ/\\v\{k\}/g;      # umlaut caron vk
+	$Line =~ s/Ň/\\v\{N\}/g;      # umlaut caron vN
+	$Line =~ s/ň/\\v\{n\}/g;      # umlaut caron vn
+	$Line =~ s/Ǒ/\\v\{O\}/g;      # umlaut caron vO
+	$Line =~ s/ǒ/\\v\{o\}/g;      # umlaut caron vo
+	$Line =~ s/Ř/\\v\{R\}/g;      # umlaut caron vR
+	$Line =~ s/ř/\\v\{r\}/g;      # umlaut caron vr
+	$Line =~ s/Š/\\v\{S\}/g;      # umlaut caron vS
+	$Line =~ s/š/\\v\{s\}/g;      # umlaut caron vs
+	$Line =~ s/Ť/\\v\{T\}/g;      # umlaut caron vT
+	$Line =~ s/ť/\\v\{t\}/g;      # umlaut caron vt
+	$Line =~ s/Ǔ/\\v\{U\}/g;      # umlaut caron vU
+	$Line =~ s/ǔ/\\v\{u\}/g;      # umlaut caron vu
+	$Line =~ s/Ž/\\v\{Z\}/g;      # umlaut caron vZ
+	$Line =~ s/ž/\\v\{z\}/g;      # umlaut caron vz
+	
+	$Line =~ s/Ø/\\O/g;           # danish O with dash
+	$Line =~ s/ø/\\o/g;           # danish o with dash
+	
+	$Line =~ s/æ/\\ae/g;          # french ae
+	$Line =~ s/œ/\\oe/g;          # french oe
+	
+	$Line =~ s/Ÿ/\\"\{Y\}/g;      # Y with two dots
+	$Line =~ s/ÿ/\\"\{y\}/g;      # y with two dots
+	
+	# Now all possible symbols which may appear in a name have been replaced. If this
+	# line is a BibTeX item line, the LaTeX codes have to be removed, i.e. \'{e} => e
+	# what is done by removing everything that is not in a certain character class.
+	if ($Line =~ m/^@/ and $Line !~ m/string/i and $Line !~ m/comment/i) {
+		$Item = $Line;
+		$Item =~ s/^(@[^{]+{)(.+)$/$1/;  # save e.g. @article{
+		$Line =~ s/^(@[^{]+{)(.+)$/$2/;  # save everthing else
+
+		# *.** added by Chaohui. If there is no $2, then there will be still something in $Line			
+		if ( $Line eq $Item ) {
+			$Line = "";
+		}
+		 
+		# $Line =~ s/[^A-Za-z@.-_+:,]//g;  # remove all chars not in a certain character class
+		
+		# search for
+		#   \\        a backslash
+		#   ["'`^~cv] followed by one character of "'`^~cv
+		#   \{        followed by {
+		#   \w        then a word character => backreference $1
+		#   \}        followed by }
+		# and replace it with
+		#   $1        the saved word character
+		$Line =~ s/\\["'`^~cv]\{(\w)\}/$1/g;       # remove several symbols
+		
+		$Line =~ s/[\\'~"^`]//g;   # remove several symbols which don't belong in there
+		$Line = $Item . $Line;     # glue them together again
+		return $Line;
+	}
+	
+	
+	# uppercase greek letters
+	# $Line =~ s/Α/A/g;
+	# $Line =~ s/Β/B/g;
+	$Line =~ s/Γ/\$\\Gamma\$/g;
+	$Line =~ s/Δ/\$\\Delta\$/g;
+	# $Line =~ s/Ε/E/g;
+	# $Line =~ s/Ζ/Z/g;
+	# $Line =~ s/Η/H/g;
+	$Line =~ s/Θ/\$\\Theta\$/g;
+	# $Line =~ s/Ι/I/g;
+	# $Line =~ s/Κ/K/g;
+	$Line =~ s/Λ/\$\\Lambda\$/g;
+	# $Line =~ s/Μ/M/g;
+	# $Line =~ s/Ν/N/g;
+	$Line =~ s/Ξ/\$\\Xi\$/g;
+	# $Line =~ s/Ο/O/g;
+	$Line =~ s/Π/\$\\Pi\$/g;
+	# $Line =~ s/Ρ/P/g;
+	$Line =~ s/Σ/\$\\Sigma\$/g;
+	# $Line =~ s/Τ/T/g;
+	$Line =~ s/Υ/\$\\Upsilon\$/g;
+	$Line =~ s/Φ/\$\\Phi\$/g;
+	# $Line =~ s/Χ/Y/g;
+	$Line =~ s/Ψ/\$\\Psi\$/g;
+	$Line =~ s/Ω/\$\\Omega\$/g;
+	
+	# lowercase greek letters
+	$Line =~ s/α/\$\\alpha\$/g;
+	$Line =~ s/β/\$\\beta\$/g;
+	$Line =~ s/γ/\$\\gamma\$/g;
+	$Line =~ s/δ/\$\\delta\$/g;
+	$Line =~ s/ε/\$\\epsilon\$/g;
+	$Line =~ s/ζ/\$\\zeta\$/g;
+	$Line =~ s/η/\$\\eta\$/g;
+	$Line =~ s/θ/\$\\theta\$/g;
+	$Line =~ s/ι/\$\\iota\$/g;
+	$Line =~ s/κ/\$\\kappa\$/g;
+	$Line =~ s/λ/\$\\lambda\$/g;
+	$Line =~ s/μ/\$\\mu\$/g;
+	$Line =~ s/ν/\$\\nu\$/g;
+	$Line =~ s/ξ/\$\\xi\$/g;
+	$Line =~ s/ο/\$o\$/g;
+	$Line =~ s/π/\$\\pi\$/g;
+	$Line =~ s/ρ/\$\\rho\$/g;
+	$Line =~ s/σ/\$\\sigma\$/g;
+	$Line =~ s/ς/\$\\varsigma\$/g;
+	$Line =~ s/τ/\$\\tau\$/g;
+	$Line =~ s/υ/\$\\upsilon\$/g;
+	$Line =~ s/φ/\$\\varphi\$/g;
+	$Line =~ s/χ/\$\\chi\$/g;
+	$Line =~ s/ψ/\$\\psi\$/g;
+	$Line =~ s/ω/\$\\omega\$/g;
+	$Line =~ s/ϑ/\$\\vartheta\$/g;
+	# $Line =~ s/ϒ/\$???\$/g;
+	$Line =~ s/ϕ/\$\\phi\$/g;
+	$Line =~ s/ϖ/\$\\varpi\$/g;
+	
+	# replace dashes with n-dashes in the title
+	if ($Line =~ m/^([\s\t]+)?(TITLE)([\s\t]+)?=([\s\t]+)?[{"]/i) { $Line =~ s/ - / -- /; }
+	
+	# surround abbreviations in capital letters with {} to avoid case change by BibTeX
+	# no { or capital letter before the abbreviation
+	# at least two capital letters
+	# no } or capital letter at the end of the match
+	# replaced by the backreference enclosed in curlies
+	# $Line =~ s/([^{A-Z])([A-Z]{2,})([^}A-Z])/$1\{$2\}$3/g;
+	
+	# PROBLEM: This does not work for the capital words after the item-{ (at the beginning
+	# of the title). It must be ensured that it is only done once, do it must not be enclosed
+	# in braces like {ABCDEF}, however, at the beginning or end there is a brace for sure.
+	
+	return $Line;	
+} # of sub PredefinedSubstitutions
+
+
+####################################################################################################
+
+
+sub CreateLabels { # creates the label (cite key) for each item in the library
+	my $Library = shift;
+	
+	my ($Item, $Label, $Labels, $Index, $Year, $Counter, $Delimiter);
+	
+	&TaskHeader ("Creating cite keys\n");
+	
+	# If the creation of new labels is not forced or only forced for labels created by Papers,
+	# then some existing labels are preserved. In either case they need to be indexed at first.
+	if ( not $Options->{f} or $Options->{fpapers} ) {
+		$Index = 0;
+		
+		foreach $Item ( @{$Library} ) {
+			$Label = $Item->{Label};
+			
+			if ($Item->{Label}) {
+				$Labels->{$Label} = $Index;
+			}
+			
+			++$Index;
+		}
+	}
+	
+	# this represents the current index of an item in @Library and is used to access a specific
+	# item if its label needs to be changed
+	$Index = -1;
+	
+	# "Double" is maybe confusing, into this hash the indices of items are added whose labels needed
+	# to be extended by (a, b, c, etc.) to avoid double entries. It's a hash because it's easier to
+	# avoid double entries in a hash than in an array where stuff is pushed into
+	my (%DoubleEntries);
+	
+	# If author, year and page number are not defined and the label is made up using the journal
+	# title or - worse - "Misc" a warning is issued to check this entry
+	my (%UnusualLabels);
+	
+	foreach $Item ( @{$Library} ) {
+		++$Index;
+		
+		# if there is a label already but the new generation of labels is forced
+		if ( ($Item->{Label} and $Options->{f}) or
+		     # or there is a label that was created by Papers and the change of these is forced
+		     ($Item->{Label} and $Options->{fpapers} and $Item->{Label} =~ /\w+:\d{4}p\d{1,6}/) ) {
+			# delete the label in the parsed data
+			delete $Item->{Label};
+			
+			# check if the first line ends with a comma (as in @article{label, )
+			if ($Item->{Entry}[0] =~ m/,$/) {
+				# remove a label at the end of the first line
+				$Item->{Entry}[0] = substr $Item->{Entry}[0], 0, index ($Item->{Entry}[0], "{")+1;
+			}
+			
+			# the label in the second line should have been already merged into the @type line, but
+			# just to be sure this was kept in
+			if ($Item->{Entry}[1] =~ m/^([^\s,]+),/) {
+				# remove a label in the second line
+				splice (@{$Item->{Entry}}, 1, 1);
+			}
+		}
+		
+		# If the first line of the entry does not end with a comma and the second line does
+		# not start with a label. This is the case if it starts with a string containing all
+		# possible characters but no blanks and commas, which is followed by a comma
+		if ( ($Item->{Entry}[0] !~ m/,$/) and
+			  (defined $Item->{Entry}[1] and ($Item->{Entry}[1] !~ m/^([^\s,]+),/) ) ) {
+			# if no author is defined, create an empty string for it to avoid a Perl error message
+			if (not defined $Item->{FirstAuthor}) { $Item->{FirstAuthor} = "" }
+			
+			# if no year is defined, create an empty string for it to avoid a Perl error message
+			if ($Options->{fy} and $Item->{Year}) {
+				$Year = $Item->{Year};
+			}
+			elsif (not $Options->{fy} and $Item->{ShortYear}) {
+				$Year = $Item->{ShortYear};
+			}
+			else {
+				$Year = "";
+			}
+			
+			# create a first label possibility depending on whether the inclusion of the page number
+			# was requested (-pn) and whether author and year are given for the current reference
+			if ($Options->{pn} and $Year and $Item->{StartPage}) {
+				$Label = "$Item->{FirstAuthor}$Options->{sep}$Year$Options->{sep}$Item->{StartPage}";
+			}
+			elsif ($Year) {
+				$Label = "$Item->{FirstAuthor}$Options->{sep}$Year";
+			}
+			else {
+				$Label = "$Item->{FirstAuthor}";
+			}
+			
+			# For some entries (e.g. @misc) bibtexformat saves a user-defined label to the field
+			# cite-key. This is non-standard so if it is present it must have been added by the
+			# script because the user wanted it. Then this label is used here.
+			if ($Item->{Fields}{"cite-key"}) { $Label = $Item->{Fields}{"cite-key"}; }
+			
+			# a special treatment is done to @Misc entries, here the actual title is used as the
+			# label and the blanks are removed
+			if ($Item->{Entry}[0] =~ m/\@MISC/i) {
+				# If the BibTeX type is corrected from @article to @misc after a Papers export,
+				# the pages field can be abused to define a custom label and is renamed to cite-key
+				# in order to avoid clashes with standard BibTeX fields.
+				if ($Item->{Fields}{"cite-key"}) {
+					$Label = $Item->{Fields}{"cite-key"};
+				}
+				else {
+					$Label = $Item->{Fields}{title};
+					$Label =~ s/\s//g;
+				}
+			}
+			
+			# if one or more parts of the label were not defined (author, year, etc.), leading
+			# and trailing separators are removed
+			$Label =~ s/^$Options->{sep}+//;
+			$Label =~ s/$Options->{sep}+$//;
+			
+			# if no author, year or page number was defined try some other fields
+			if ($Label eq "") {
+				if ($Item->{Fields}{journal}) {
+					$Label = $Item->{Fields}{journal} . $Options->{sep};  # take the journal name as label
+					$Label =~ s/\s//g;          # remove all blanks from it
+				}
+				else {
+					$Label = "Misc$Options->{sep}";
+				}
+				
+				$UnusualLabels{$Index} = 1;
+			}
+			
+			# By now all possible symbols which may appear in a name have been replaced. If this
+			# line is a BibTeX item line, the LaTeX codes have to be removed, i.e. \'{e} => e
+			# what is done by removing everything that is not in a certain character class.
+			# It is necessary in this order because many symbols replaced by the script turn
+			# up as unicode garbage, which has to be cleared up first (translated into e.g. \'{e}.
+			$Label = &CleanString ($Label);
+			
+			# &CleanString is also used on whole item lines and therefore braces ("{" and "}") cannot
+			# be removed by default. In the label there must not be any, so they are removed now.
+			$Label =~ s/[\{\}]//g;
+			$Label =~ s/\s//g;
+			
+			# if this label was already assigned before ("defined" because the first element is 0 = false)
+			if (defined $Labels->{$Label}) {
+				# A double entry for the label may occur for the Author:Year style and the user is warned
+				# in the usage that the Endnote database has to be sorted by record entries to assure the
+				# same sequence at all times (Author:03b has to be always Author:03b and must not switch
+				# the last letter).
+				# However, when using the page numbers, the user does not expect there to be double entries
+				# and it is the sign of either double entries in the library or other problems. In this case
+				# the problematic entry is printed out to warn the user
+				
+				if ($Options->{pn}) {
+					$DoubleEntries{$Index} = 1;
+					
+					# also add the original publication with the "offending" label
+					$DoubleEntries{ $Labels->{$Label} } = 1;
+				}
+				
+				# If there is more than one Author:Year combination, they should all be lettered
+				# (Author:03a and Author:03b rather than Author:03 and Author:03a)
+				# Thus, when the second occurrence is found, the first one is renamed ending with "a" using
+				# the saved index in $Labels->{$Label} and $Labels->{Label} then set to -1 to avoid a second
+				# change. However, even the value -1 means that it is still defined and double labels are
+				# detected.
+				
+				if ($Labels->{$Label} != -1) { # if the label has not yet been changed
+					# add a leading "a" to it using the saved index in the $Library hash
+					$Library->[$Labels->{$Label}] {Entry} [0] =~ s/,$/a,/;
+					$Library->[$Labels->{$Label}] {Label} .= "a";
+					
+					# set the value in the $Labels hash to -1 to mark it as already changed
+					$Labels->{$Label} = -1;
+				}
+				
+				$Counter = "b";
+				
+				# increase the counter until a free, unused combination is found
+				until (not defined $Labels->{"$Label$Counter"}) { ++$Counter }
+				
+				# glue the label and the counter together
+				$Label = $Label . $Counter;
+			} # if (defined $Labels->{$Label})
+			
+			# By now all possible symbols which may appear in a name have been replaced. If this
+			# line is a BibTeX item line, the LaTeX codes have to be removed, i.e. \'{e} => e
+			# what is done by removing everything that is not in a certain character class.
+			# It is necessary in this order because many symbols replaced by the script turn
+			# up as unicode garbage, which has to be cleared up first (translated into e.g. \'{e}.
+			$Label = &CleanString ($Label);
+			
+			# mark the new label as used and safe its index in the array
+			$Labels->{$Label} = $Index;
+			
+			$Item->{Label} = $Label;
+			
+			# add the new label to the @type line and add a comma at the end
+			$Item->{Entry}[0] = $Item->{Entry}[0] . $Label . ",";
+		} # if ( ($Item->{Entry}[0] !~ m/,$/) and ($Item->{Entry}[1] !~ m/^([^\s,]+),/) )
+	} # of foreach $Item ( @{$Library} )
+	
+	# if labels were created using the journal title or "Misc" it is most likely that they will
+	# also appear in the list with double entries. Since it is pointless to warn twice about the
+	# same entry, all references present in the DoubleEntries list are removed from the UnusualLabels
+	# warning message
+	foreach $Index ( keys %UnusualLabels ) {
+		if (defined $DoubleEntries{$Index}) {
+			delete $UnusualLabels{$Index};
+		}
+	}
+	
+	if (%UnusualLabels) {
+		&Output ("\n" ,
+		         "    WARNING:\n" ,
+		         "    In the following references several fields were missing when creating the labels\n" ,
+		         "    workarounds were used to create the labels. Check carefully whether you can add\n" ,
+		         "    missing information.\n\n");
+		
+		# this is used to produce a sorted output so that Author:01a, Author:01b, etc.  are output together.
+		my @Output;
+		
+		foreach $Index ( keys %UnusualLabels ) {
+			push @Output, &RefSummary ($Library->[$Index]);
+		}
+		
+		@Output = sort @Output;
+		&Output ( join ("\n\n", @Output), "\n\n");
+		
+		if (not $Options->{abb}) {
+			&TaskHeader (""); # print just the separator line
+		}
+	}
+	
+	if (%DoubleEntries) {
+		&Output ("\n" .
+		         "    WARNING:\n" .
+		         "    Although the page number is used to create the label, double entries were found\n" .
+		         "    and were numbered sequentially. Check the following entries carefully to avoid\n" .
+		         "    citing the wrong paper.\n" .
+		         "    Usually when using page numbers this simply points you to double entries.\n\n");
+		
+		# this is used to produce a sorted output so that Author:01a, Author:01b, etc.  are output together.
+		my @Output;
+		
+		foreach $Index ( keys %DoubleEntries ) {
+			push @Output, &RefSummary ($Library->[$Index]);
+		}
+		
+		@Output = sort @Output;
+		&Output ( join ("\n\n", @Output), "\n\n");
+		
+		if (not $Options->{abb}) {
+			&TaskHeader (""); # print just the separator line
+		}
+	}
+} # of sub CreateLabels
+
+
+####################################################################################################
+
+
+sub AbbreviateJournals { # abbreviates the journal titles
+	my $Library  = shift;
+	my $AbbFiles = shift;
+	
+	my ($File, @Abbreviations, @Content, @Fields, $Line, $i);
+	my ($Ref, $Found, $Journal, $RefJournal, $Abbreviation);
+	my (%UnknownJournals, %NoAbbreviation, @NoJournal, @NotFound);
+	
+	&TaskHeader ("Abbreviating journal titles\n");
+	
+	# if no specific abbreviation or the full title was requested use the first one by default
+	if (not $Options->{full} and not $Options->{abb1} and not $Options->{abb2}) {
+		$Options->{abb1} = 1;
+	}
+	
+	if ( ($Options->{abb1} and $Options->{abb2}) or 
+		  ($Options->{full} and ($Options->{abb1} or $Options->{abb2})) ) {
+		&Output ("STDERR", "$ERROR: Either -abb1, -abb2, or -full can be selected at a time.\n\n");
+		exit 20;
+	}
+	
+	foreach $File ( @{$AbbFiles} ) { # read all the files containing journal abbreviations
+		if (not -f $File) {
+			&Output ("STDERR", "$ERROR: File $File not found! This may be one of the default\n",
+			         "abbreviation files defined at the beginning of the script, check there.\n\n");
+			exit 22;
+		}
+		
+		open FILE, "<$File" or die "$ERROR: Could not open file $File: $!";
+		@Content = <FILE>;
+		close FILE;
+		
+		while (@Content) {
+			$Line = shift @Content;             # read the next line
+			$Line =~ s/^\s+//g;                 # remove leading spaces which may cause problems otherwise
+			@Fields = split /\t/, $Line;        # split the line into columns using tabs as delimiters
+			
+			for $i ( 0 .. $#Fields ) {
+				# remove leading and trailing blanks in order to avoid problems with the string comparison later
+				if ($Fields[$i]) { $Fields[$i] =~ s/^[\s\t]+|[\s\t]+$//g; }
+			}
+			
+			# set empty stings if the abbreviations are not defined to avoid Perl errors later
+			if (not $Fields[1]) { $Fields[1] = "" }
+			if (not $Fields[2]) { $Fields[2] = "" }
+			
+			# Save the current journal with its abbreviations exactly as given in the abbreviation files
+			# and additionally the "cleaned" strings. This is for speed reasons, to only to that once.
+			push @Abbreviations, {
+			     Title      => $Fields[0],
+			     TitleClean => &CleanString ($Fields[0]),
+			     abb1       => $Fields[1],
+			     abb1Clean  => &CleanString ($Fields[1]),
+			     abb2       => $Fields[2],
+			     abb2Clean  => &CleanString ($Fields[2])
+			};
+		}
+	}
+	
+	# @Abbreviations now contains a list with all titles and their abbreviations in the exact order
+	# as they appeared in the input files. The search will be top-down, i.e. first come, first served
+	
+	foreach $Ref ( @{$Library} ) { # run over all references in the $Library
+		# ignore books
+		if ($Ref->{Entry}[0] =~ m/\@book/i) { next }
+		
+		if (not $Ref->{Fields}{journal}) {       # if no journal entry is found for this item
+			# only process the item if it's an article, for e.g. manuals it's OK not to have a journal tag
+			if ($Ref->{Entry}[0] !~ m/\@article/i) { next }
+			$Line = &RefSummary ($Ref);   # create a short summary of the entry
+			push @NoJournal, $Line;       # add it to the list of articles without a journal entry
+			next;
+		}
+		
+		$Found = 0;
+		
+		$RefJournal = $Ref->{Fields}{journal};   # this is the current entry (could be the full title or already abbreviated)
+		
+		# The title may contain already translated symbols like \'{e}, which have to be removed first to
+		# compare the title to the abbreviation list. This turns \'{e} into e.
+		
+		$RefJournal = &CleanString ($RefJournal);
+		
+		# remove several other stuff which doesn't belong in there (the single apostrophe '
+		# is not included there as it may be used validly in there, e.g. l'Academie)
+		# $RefJournal =~ s/[\\{}~"^`]//g;
+		
+		foreach $Journal ( @Abbreviations ) {
+			# the following comparisons test case-insensitively for a match and take into account that
+			# in the library some journal titles may already be abbreviated and would even catch the
+			# case if a journal is abbreviated with the wrong possibility and correct it.
+			if ( (lc $RefJournal eq lc $Journal->{TitleClean} )  or
+				  (lc $RefJournal eq lc $Journal->{abb1Clean}  )   or
+				  (lc $RefJournal eq lc $Journal->{abb2Clean}  ) )  {
+					
+				if ($Options->{abb1}) {     # if abbreviation 1 is to be taken
+					if ($Journal->{abb1}) {  # and one exists
+						$Abbreviation = $Journal->{abb1};
+					}
+					else { # if there is no abb1, there also cannot be abb2
+						last;
+					}
+				}
+				elsif ($Options->{abb2}) {  # if abbreviation 2 is to be taken
+					if ($Journal->{abb2}) {  # and if a second abbreviation exists for this journal
+						$Abbreviation = $Journal->{abb2};
+					}
+					else {
+						# add the journal entry to the list of journals without abbreviation
+						# this is the version with LaTeX symbol codes (e.g. {\"u} removed
+						$NoAbbreviation{$RefJournal} = 1;
+						next;
+					}
+				}
+				elsif ($Options->{full}) {
+					$Abbreviation = $Journal->{Title};
+				}
+				
+				# now replace the journal title in the actual BibTeX entry
+				$i = 0;
+				
+				# it was already checked for $Ref->{Fields}{journal} and if this exists there also must
+				# be a line in the Entry field
+				$i++  until (                                    # increase $i until
+						(not defined $Ref->{Entry}[$i])            # an undefined entry was found
+							or                                      # or
+						($i > $#{$Ref->{Entry}})                   # the size of the array is reached
+							or                                      # or
+						($Ref->{Entry}[$i] =~ m/journal([\s\t]+)?=/i)  # the line containing the journal is found
+						);
+						
+				# Debugging stuff
+				# if (not $Ref->{Entry}[$i]) {
+				# 	print Dumper $Ref->{Entry};
+				# 	next;
+				# }
+				
+				# dp ($Ref, $Journal, $RefJournal);
+				
+				if (not $Ref->{Entry}[$i]) {
+					$Found = 0;
+				}
+				else {
+					# strings have to be cleaned before using them in a RegEx, otherwise in {\'\i} the \i would
+					# be misinterpreted as a RegEx-command
+					$Ref->{Fields}{journal} = &CleanString ($Ref->{Fields}{journal});
+					$Ref->{Entry}[$i]       = &CleanString ($Ref->{Entry}[$i]);
+					
+					# replace the title in the BibTeX entry
+					$Ref->{Entry}[$i] =~ s/$Ref->{Fields}{journal}/$Abbreviation/;
+					
+					# replace the original journal title with the abbreviation
+					$Ref->{Fields}{journal} = $Abbreviation;
+					
+					# and stop processing of the current reference (the first match counts going through
+					# files in the order given via the command line and then in the script under defaults)
+					$Found = 1;
+					last;
+				}
+			}
+			elsif (lc $RefJournal eq lc $Journal->{abb1}) {
+				$Found = 1;
+				last;
+			}
+		}
+		
+		if (not $Found) {
+			$Line = &RefSummary ($Ref);
+			$Line = &CleanString ($Line);
+			push @NotFound, $Line;
+			
+			$UnknownJournals{$RefJournal} = 1;
+		}
+	}
+	
+	if (@NoJournal) {
+		&Output ("\n    In the following entries no journal tag was found:\n" ,
+		         "    --------------------------------------------------\n\n");
+		
+		&Output ( join ("\n\n", @NoJournal), "\n\n" );
+	}
+	
+	if (@NotFound) {
+		# &Output ("\n    For the following entries no abbreviation was found:\n",
+		#            "    ----------------------------------------------------\n\n");
+		#
+		# &Output ( join ("\n\n", @NotFound), "\n\n");
+		
+		&Output ("\n    Summary of all journals with unknown abbreviation:\n",
+		           "    --------------------------------------------------\n\n");
+		
+		&Output ("       ", join ("\n       ", sort keys %UnknownJournals), "\n\n" );
+		
+		# &Output ("Total number of unknown journals: ");
+		# &Output (scalar (keys %UnknownJournals), "\n\n");
+	}
+	
+	if (%NoAbbreviation) {
+		if ($Options->{abb1}) { $i = "1st" }
+		if ($Options->{abb2}) { $i = "2nd" }
+		
+		&Output ("\n   For the following journals no $i abbreviation was found:\n",
+		           "   ---------------------------------------------------------\n\n");
+		
+		&Output ( join ("\n", sort keys %NoAbbreviation), "\n\n");
+	}
+	
+	# &TaskHeader (""); # print just the separator line
+} # of sub AbbreviateJournals
+
+
+####################################################################################################
+
+
+sub SortLibrary { # sorts the library alphabetically after the cite keys
+	my $Library = shift;
+	my ($i, $Item, $Labels, $Index, $Label, $SortedLibrary);
+	
+	&TaskHeader ("Sorting library\n");
+	
+	$Index = 0; # the array index of the items, used for sorting the array
+	
+	foreach $Item ( @{$Library} ) {
+		if ($Item->{Label} and defined $Labels->{$Item->{Label}}) {
+			&Output ("WARNING: Label $Label has been found more than once! Sorting disabled\n");
+			$Options->{sort} = 0;
+			return $Library;
+		}
+		
+		if ($Item->{Label}) {
+			$Labels->{$Item->{Label}} = $Index; # save the index of the item in the $Library array
+		}
+		else {
+			&Output ("WARNING: No label defined for the entry below, sorting is disabled.\n", &RefSummary ($Item), "\n");
+			$Options->{sort} = 0;
+			return $Library;
+		}
+		
+		++$Index;
+	} # of foreach $Item
+	
+	if ($Options->{sort}) {
+		foreach $Label ( sort {lc $a cmp lc $b} keys %{$Labels} ) {
+			if ($Labels->{$Label} != -1) {
+				push @{$SortedLibrary}, $Library->[ $Labels->{$Label} ];
+			}
+		}
+		
+		return $SortedLibrary;
+	}
+	else {
+		return $Library;
+	}
+	
+} # of sub SortLibrary
+
+
+####################################################################################################
+
+
+sub TypeReset { # changes all BibTeX types to @article
+	my $Library = shift;
+	my ($Line, $Item, $i);
+	
+	foreach $Item ( @{$Library} ) {
+		if ($Item->{RefType} and $Item->{RefType} !~ m/article/) {
+			ReplaceType ($Item, "RefType", "\@article");
+		}
+	}
+} # of sub TypeReset
+
+
+####################################################################################################
+
+
+sub TypeConversion { # converts from one BibTeX type to another (e.g. @article => @book)
+	my $Library = shift;
+	my ($Line, $Item, $i);
+	my (%UserTypes, $Field, $Conversion, $Condition, $Change, $RefType, $OK, $Value, $True);
+	
+	my $Files = { # a hash of hashes
+		Found    => {},
+		NotFound => {},
+	};
+	
+	&TaskHeader ("Checking reference types for necessary conversions\n");
+	
+	# Read all reference types that are handled in user-defined replacements. If the user
+	# defined his/her own settings for @book then these are given preference and the hard-
+	# coded routine is not performed.
+	if ( @TypeConversions ) {
+		foreach $Conversion ( @TypeConversions ) {
+			foreach $Change ( @{$Conversion->{Changes}} ) {
+				if ($Change->{Replace} and $Change->{Replace} eq "RefType") {
+					$RefType = lc $Change->{With};
+					$RefType =~ s/[\\\@]//g;
+					$UserTypes{$RefType} = 1;
+				}
+			}
+		}
+	}
+	
+	# dp (\%UserTypes);
+	
+	foreach $Item ( @{$Library} ) {
+		# ignore @comment and @string entries
+		if ($Item->{RefType} =~ m/^string$/i or $Item->{RefType} =~ m/^comment$/i) {
+			next;
+		}
+		
+		# check all user-defined conversions
+		foreach $Conversion ( @TypeConversions ) {
+			# onlu one of the conditions has to be true
+			&CheckConditions (Instructions => $Conversion, Item => $Item, Files => $Files, AllTrue => 0);
+		} # of foreach $Conversion ( @TypeConversions )
+		
+		# If the user does not redefine any of the default type fixes, they are carried out here.
+		if ( not $UserTypes{book} and
+		        # the affiliation field is "book"
+		     ( ($Item->{Fields}{affiliation} and $Item->{Fields}{affiliation} =~ m/^Book$/i) or
+		        # the type field is "book"
+		       ($Item->{Fields}{Type} and $Item->{Fields}{Type} =~ m/^Book$/i) or
+		        # the item is a @book (Papers does it sometimes, but important fields are missing)
+		       ($Item->{RefType} and $Item->{RefType} =~ m/^Book$/i) ) )
+			{
+				ReplaceType ($Item, "RefType", "\@book");
+				ReplaceType ($Item, "volume",  "address");
+				ReplaceType ($Item, "journal", "publisher");
+				ReplaceType ($Item, "number",  "edition");
+			}
+		
+		if ( not $UserTypes{inbook} and
+		          # the affiliation field is "inbook"
+		     ( ( ($Item->{Fields}{affiliation} and $Item->{Fields}{affiliation} =~ m/^InBook$/i) or
+		      # the type field is "inbook"
+		       ($Item->{Fields}{Type} and $Item->{Fields}{Type} =~ m/^InBook$/i) or
+		      # the item is @inbook
+		       ($Item->{RefType} and $Item->{RefType} =~ m/^InBook$/i) ) ) )
+			{
+				ReplaceType ($Item, "RefType", "\@inbook");
+				ReplaceType ($Item, "volume",  "address");
+				ReplaceType ($Item, "journal", "publisher");
+				ReplaceType ($Item, "number",  "edition");
+			}
+		
+		if ( not $UserTypes{misc} and
+		        # the journal field is "misc"
+		     ( ($Item->{Fields}{journal} and $Item->{Fields}{journal} =~ m/^Misc$/i) or
+		       # the type field is "misc"
+		      ($Item->{Fields}{Type} and $Item->{Fields}{Type} =~ m/^Misc$/i) or
+		      # the item is @misc
+		     ($Item->{RefType} and $Item->{RefType} =~ m/^Misc$/i) ) )
+			{
+				DeleteField ($Item, "journal");
+				ReplaceType ($Item, "RefType", "\@misc");
+				ReplaceType ($Item, "url",     "howpublished");
+				ReplaceType ($Item, "pages",   "cite-key");
+				ReplaceType ($Item, "doi",     "note");
+			}
+			
+		if ( not $UserTypes{phdthesis} and
+		     (  $Item->{Fields}{journal} and
+		        $Item->{Fields}{journal} =~ m/^(Dissertation|Diplomarbeit|Thesis)/i ) )
+			{
+				ReplaceType ($Item, "RefType",     "\@phdthesis");
+				ReplaceType ($Item, "affiliation", "school");
+				ReplaceType ($Item, "journal",     "type");
+			}
+			
+		if ( not $UserTypes{mastersthesis} and
+		     ( $Item->{Fields}{journal} and $Item->{Fields}{journal} =~ m/^MastersThesis/i ) )
+			{
+				DeleteField ($Item, "journal");
+				ReplaceType ($Item, "RefType",     "\@mastersthesis");
+				ReplaceType ($Item, "affiliation", "school");
+			}
+			
+		if ( not $UserTypes{techreport} and
+		     ( $Item->{Fields}{journal} and $Item->{Fields}{journal} =~ m/^TechReport/i ) )
+			{
+				DeleteField ($Item, "journal");
+				ReplaceType ($Item, "RefType",     "\@techreport");
+				ReplaceType ($Item, "affiliation", "institution");
+				ReplaceType ($Item, "volume",      "type");
+				ReplaceType ($Item, "pages",       "address");
+			}
+			
+		if ( not $UserTypes{incollection} and
+		     ( $Item->{Fields}{affiliation} and $Item->{Fields}{affiliation} =~ m/^InCollection/i ) )
+			{
+				DeleteField ($Item, "affiliation");
+				ReplaceType ($Item, "RefType",     "\@incollection");
+				ReplaceType ($Item, "volume",      "booktitle");
+				ReplaceType ($Item, "journal",     "publisher");
+				ReplaceType ($Item, "number",      "address");
+				ReplaceType ($Item, "doi",         "editor");
+			}
+		
+		if ( not $UserTypes{inproceedings} and
+		     ( $Item->{Fields}{affiliation} and $Item->{Fields}{affiliation} =~ m/^inproceedings/i ) )
+			{
+				DeleteField ($Item, "affiliation");
+				ReplaceType ($Item, "RefType",     "\@inproceedings");
+				ReplaceType ($Item, "journal",     "booktitle");
+				ReplaceType ($Item, "number",      "address");
+			}
+	} # of foreach $Item ( @{$Library} )
+	
+	if (keys %{$Files->{NotFound}}) { # any files weren't found then there is an entry in this hash
+		# read all filenames into an array (going via a hash takes care of printing each filename
+		# only once)
+		my @Files = keys %{$Files->{NotFound}};
+		
+		# watch out for the grammar...
+		if (scalar @Files == 1) {
+			&Output ("\nWARNING: The following file is configured in a TypeFix block in $Configuration\n" .
+			         "         but was not found:\n");
+		}
+		else {
+			&Output ("\nWARNING: The following files are configured in TypeFix blocks in $Configuration\n" .
+			         "         but were not found.\n");
+		}
+		print "          - ";
+		print join "\n          - ", @Files;
+		print "\n\n";
+	} # if (%FilesNotFound)
+} # of sub TypeConversion
+
+
+####################################################################################################
+
+
+sub LinkConversion { # converts file and local-url
+	my $Library = shift;
+	my ($Item, $Line, $ContentLine, $Index, @Fields, $URL, $File, @LocalURLFound, $EntryLines, $Ext);
+	
+	# During the conversion
+	#  - No data should be deleted. If converting from one link type to another, the old one is
+	#    preserved. A "local-url" is added to the "file" field (it's an array), but only if the
+	#    link does not already exist there.
+	#  - The first PDF link is given precedence. While JabRef can handle all different kinds of
+	#    file types, Papers only supports PDFs. If multiple PDFs are defined in "file", the first
+	#    one is chosen.
+	foreach $Item ( @{$Library} ) {
+		# if a conversion to the Papers URL format is requested
+		# convert file => local-url
+		if ($Options->{file2local} and $Item->{File}) {
+			$URL = undef; # reinitialize for each file
+			
+			# if more than one file is defined (local-url only supports a single link)
+			# take the first found link to a PDF
+			foreach $File ( @{$Item->{File}} ) {
+				if (defined $File->{Type} and $File->{Type} =~ m/PDF/i) {
+					$URL = $File->{URL};
+					last; # leave the loop (use the first PDF)
+				}
+			}
+			
+			# if no PDF link was found in the file entry, simply use the first link, whatever it is
+			if (not $URL) { $URL = $Item->{File}[0]{URL}; }
+			
+			# now there is definitely a link to a file (either to the first PDF or to the first file)
+			# perform the replacements defined in the configuration file, usually a conversion between
+			# a file system path (/Users/user/....) and an actual URL (file://localhost/...)
+			$URL =~ s/$FileURL/$LocalURL/;
+			
+			# replace all blanks with %20 (in "file" blanks are given, for a URL these have to be
+			# replaced with %20)
+			$URL =~ s/\s/%20/g;
+			$Line = "local-url = {$URL},";
+			
+			# if a local-url entry was already present
+			if ($Item->{LocalURL}) {
+				if ($URL !~ $Item->{Fields}{"local-url"}) {
+					push @LocalURLFound, &RefSummary ($Item);
+				}
+				
+				$Item->{Fields}{"local-url"} = $URL;
+				
+				$Index = GetIndex ($Item, "local-url");
+				$Item->{Entry}[$Index] = $Line;
+			}
+			else { # no previous local-url entry found
+				# the {Fields} hash just holds the field contents for each field keyword
+				$Item->{Fields}{"local-url"} = $URL;
+				
+				$EntryLines = $#{$Item->{Entry}};
+				
+				# To add the line to actual entry (array of all files as found in the BibTeX file),
+				# it is important that the last line contains the final brace (sub ParseBibTeX takes
+				# care of that). While a comma after the last field does not cause problems, it is
+				# not compulsory and it needs to be checked whether it is there.
+				if ($Item->{Entry}[$EntryLines-1] !~ m/,$/) {
+					$Item->{Entry}[$EntryLines-1] = $Item->{Entry}[$EntryLines-1] . ",";
+				}
+				
+				$Index = GetIndex ($Item, "file");
+				# inject the new local-url line after the "file" line in the BibTeX entry
+				splice @{$Item->{Entry}}, $Index+1, 0, ($Line);
+			}
+			
+			if (@LocalURLFound) {
+				&Output ("During to conversion from file to local-url a previous local-url entry was found for\n",
+				         "the following items and was replaced.\n\n",
+				         join ("", @LocalURLFound), "\n" );
+			}
+		}
+		
+		# if a conversion to the JabRef URL format is requested
+		# convert local-url => file
+		if ($Options->{local2file} and $Item->{Fields}{"local-url"}) {
+			$URL = $Item->{Fields}{"local-url"};
+			
+			# replace the path, which is different in Papers/BibDesk and JabRef
+			$URL =~ s/$LocalURL/$FileURL/;
+			
+			# replace all %20 with blanks (in "file" blanks are given, for a URL these have to be
+			# replace with %20) the \\? includes (or better removes) an optional backslash before
+			# the %, Papers add this
+			$URL =~ s/\\?%20/ /g;
+			
+			# read the file extension, everything after the last dot until the end
+			$Ext = substr $URL, rindex ($URL, ".") + 1;
+			$Ext = uc $Ext;
+			
+			$ContentLine = ":$URL:$Ext";
+			$Line = "file = {$ContentLine},";
+			
+			# if no previously existing file entry was found
+			if (not $Item->{File}) {
+				# add the parsed entry
+				push @{$Item->{File}}, { Comment => "", URL => $URL, Type => "PDF" };
+				
+				# add the plain field content
+				$Item->{Fields}{file} = $ContentLine;
+				
+				# add the line in the actual BibTeX entry
+				$Index = GetIndex ($Item, "local-url");
+				# inject the new local-url line after the "local-url" line in the BibTeX entry
+				splice @{$Item->{Entry}}, $Index+1, 0, ($Line);
+			}
+			else { # if a file entry was already there
+				my $Linked = 0;
+				
+				# check whether the local-url file is already linked to in the file entry
+				foreach $File ( @{$Item->{File}} ) {
+					if ($File->{URL} =~ m/$URL/) { $Linked = 1; }
+				}
+				
+				if (not $Linked) {
+				# if it wasn't liked before, add the file as *first* link to the list
+					unshift @{$Item->{File}}, { Comment => "", URL => $URL, Type => "PDF" };
+					
+					# add the plain field content
+					my $OldContentLine = $Item->{Fields}{file};
+					$Item->{Fields}{file} = $ContentLine . "; $OldContentLine";
+					
+					# add the line in the actual BibTeX entry
+					$Index = GetIndex ($Item, "file");
+					$Item->{Entry}[$Index] = "file = {" . $ContentLine . "; $OldContentLine },";
+				}
+			}
+		} # if ($Options->{local2file} and $Item->{Fields}{LocalURL})
+	} # of foreach $Item ( @{$Library} )
+} # of sub LinkConversion
+
+
+####################################################################################################
+
+
+sub FieldRegEx { # uses regular expressions on particular fields
+	my $Library = shift;
+	my ($Item, $Field, $From, $To, $Index, $Prefix, $Suffix, $Entry);
+	my ($RegEx, @RegExes, $OldEntry);
+	
+	&TaskHeader ("Using regular expressions on 'file' fields\n");
+	
+	# check if the number of parameters given to -fileregex is even
+	if (scalar @{$Options->{fieldregex}} % 3 != 0) {
+		# if the remainder of the number divided by 2 is not 0, it's not an even number
+		print "$ERROR: The number of parameters for -fieldregex must be divisible by 3. Use the option like this:\n\n";
+		print "      -fieldregex fieldname \"from\" \"to\" fieldname \"from\" \"to\"\n\n";
+		exit 26;
+	}
+	else { # if the number of parameters given to -fileregex is even
+		while ( @{$Options->{fieldregex}} ) {
+			# create a new hash for each regex
+			my $RegEx = {
+				Field => shift @{$Options->{fieldregex}},
+				From  => shift @{$Options->{fieldregex}},
+				To    => shift @{$Options->{fieldregex}},
+			};
+			
+			push @RegExes, $RegEx;
+		}
+	}
+	
+	# dp (\@RegExes);
+	
+	foreach $Item ( @{$Library} ) { # run over each BibTeX item
+		foreach $RegEx ( @RegExes ) { # run over all regular expressions
+			# all field names are lowercase
+			$Field = lc $RegEx->{Field};
+			$From  = $RegEx->{From};
+			$To    = $RegEx->{To};
+			
+			# "*" means to operate on all fields. If the field is not an asterisk,
+			# check whether it is present to use the reg ex on it.
+			if ($Field ne "*" and $Item->{Fields}{$Field}) {
+				# use the regex on the {Fields} entry
+				$Item->{Fields}{$Field} =~ s/$From/$To/g;
+				
+				# get the index of the "file" line in the {Entry} key (array, with the same field
+				# sequence as in the library)
+				$Index = GetIndex ( $Item, $Field );
+				if (not defined $Index) { next }
+				
+				($Prefix, $Suffix, $Entry) = FieldContent ($Item->{Entry}[$Index]);
+				$Entry =~ s/$From/$To/g;
+				
+				$Item->{Entry}[$Index] = $Prefix . $Entry . $Suffix;
+			}
+			elsif ($Field eq "*") { # if the field is an asterisk, run over all fields
+				foreach $Field ( keys %{$Item->{Fields}} ) {
+					# use the regex on the {Fields} entry
+					$Item->{Fields}{$Field} =~ s/$From/$To/g;
+					
+					# get the index of the "file" line in the {Entry} key (array, with the same field
+					# sequence as in the library)
+					$Index = GetIndex ( $Item, $Field );
+					if (not defined $Index) { next }
+					
+					($Prefix, $Suffix, $Entry) = FieldContent ($Item->{Entry}[$Index]);
+					$Entry =~ s/$From/$To/g;
+					
+					$Item->{Entry}[$Index] = $Prefix . $Entry . $Suffix;
+				} # of foreach $Field ( keys %{$Item->{Fields}} )
+			} # of elsif ($Field eq "*")
+		} # of foreach $RegEx ( @RegExes )
+	} # of foreach $Item ( @{$Library} )
+} # of sub FieldRegEx
+
+
+####################################################################################################
+
+
+sub FileRegEx { # uses one or more regular expressions on each entry of a file field
+	my $Library = shift;
+	my ($Item, $File, $From, $To, $Index, $Line);
+	my (@RegExes, $OldEntry, $Prefix, $Suffix);
+	
+	&TaskHeader ("Using regular expressions on 'file' fields\n");
+	
+	# check if the number of parameters given to -fileregex is even
+	if (scalar @{$Options->{fileregex}} % 2 != 0) {
+		# if the remainder of the number divided by 2 is not 0, it's not an even number
+		print "$ERROR: Odd number of parameters for -fileregex. Use the option like this:\n\n";
+		print "      -fileregex \"from1\" \"to1\" \"from2\" \"to2\"\n\n";
+		print "      Each pair is evealuated as regular expression on every filename of the 'file' fields\n\n";
+		exit 27;
+	}
+	else { # if the number of parameters given to -fileregex is even
+		while ( @{$Options->{fileregex}} ) {
+			# create a new hash for each regex
+			my $RegEx = {
+				From => shift @{$Options->{fileregex}},
+				To   => shift @{$Options->{fileregex}},
+			};
+			
+			push @RegExes, $RegEx;
+		}
+	}
+	
+	# dp (\@RegExes);
+	
+	foreach $Item ( @{$Library} ) { # run over each BibTeX item
+		if ($Item->{File}) { # an the file field (if one is present)
+			# $Line is used to store the changed values
+			$Line = "";
+			
+			foreach $File ( @{$Item->{File}} ) { # and use every given regex
+				my $RegEx;
+				
+				foreach $RegEx ( @RegExes ) {
+					$From = $RegEx->{From};
+					$To   = $RegEx->{To};
+					
+					# print "RegEx:    s/$From/$To/g\n";
+					# print "Before:   $File->{URL}\n";
+					$File->{URL} =~ s/$From/$To/g;
+					# print "After:    $File->{URL}\n\n";
+				}
+				
+				$Line = $Line . $File->{Comment} . ":" . $File->{URL} . ":" . $File->{Type} . ";";
+			} # of foreach $File ( @{$Item->{File}} )
+			
+			# add the changed entry to the {Fields} entry (a hash to access the fields via the
+			# actual field name)
+			$Item->{Fields}{file} = $Line;
+			
+			# get the index of the "file" line in the {Entry} key (array, with the same field
+			# sequence as in the library)
+			$Index = GetIndex ( $Item, "file" );
+			if (not defined $Index) { next }
+			
+			# extract the old entry, everything before the field content and everything after
+			($Prefix, $Suffix, $OldEntry) = FieldContent ($Item->{Entry}[$Index]);
+			
+			# replace the old entry with the new one while keeping the old start and end of the line
+			$Item->{Entry}[$Index] = $Prefix . $Line . $Suffix;
+			#dp ($Index, $Item, $FieldContent);
+		} # of if ($Item->{File})
+	} # of foreach $Item ( @{$Library} )
+} # of sub FileRegEx
+
+
+####################################################################################################
+
+
+sub FileCheck { # checks the files referenced in the 'file' and local-url fields for existence
+	# ===============================================================================
+	# Many thanks to Thomas Braun for the idea and part of the code for this routine!
+	# ===============================================================================
+	my $Library = shift;
+	my ($Item, $File, $URL, $FileURL);
+	
+	&TaskHeader ("Checking that all referenced files exist\n");
+	
+	# command line parameters are given precedence over values read from a configuration file
+	if ($Options->{filedir}) { $FileDir = $Options->{filedir}              }
+	                    else { if (not defined $FileDir) { $FileDir = "" } }
+	
+	if ($FileDir) {
+		if (not -e $FileDir) {
+			&Output ("       The directory specified by -filedir, $FileDir, does not exist. "
+			              . "skipping file check.\n");
+			return (0);
+		}
+		elsif (not -d $FileDir) {
+			&Output ("       The path specified by -filedir, $FileDir, is not a directory. "
+			              . "skipping file check.\n");
+			return (0);
+		}
+	}
+	
+	foreach $Item ( @{$Library} ) {
+		if ($Item->{File}){
+			foreach $File ( @{$Item->{File}} ) {
+				if (not defined $File->{URL}) {
+					&Output ("       File field contains no URL, or wrong format, skipping.\n");
+					$FileURL = undef;
+					next; # no file URL present, maybe wrong format
+				}
+				
+				if ($FileDir) {
+					$FileURL = File::Spec->catfile($FileDir, $File->{URL});
+				}
+				else { # no FileDir given
+					$FileURL = $File->{URL};
+					$FileURL =~ s/\\ / /g;  # replace escaped blanks in the filename
+				}
+				
+				if ( -e $FileURL and -f $FileURL ) { # exists and is a file
+					if ( -z $FileURL ) { # has zero size
+						&Output ("       File size is zero:   $FileURL\n");
+					}
+				}
+				else {
+					&Output ("       File does not exist: $FileURL\n");
+				}
+			} # of foreach $File
+		} # of if $Item->{File}
+		
+		if ($Item->{LocalURL}) {
+			if ($FileDir) {
+				$URL = File::Spec->catfile($FileDir, $Item->{LocalURL});
+			}
+			else { # no FileDir given
+				$URL = $Item->{LocalURL};
+			}
+			
+			# replace all %20 with blanks (in "file" blanks are given, for a URL these have to
+			# be replace with %20)
+			# \\? is an optional backslash in case the percent was escaped
+			$URL =~ s!\\?%20! !g;
+			
+			# Papers' local-url entries are formatted file://localhost and this is changed into
+			# the 'real' absolute paths of the file field used by JabRef
+			$URL =~ s!$LocalURL!$FileURL!;
+			
+			if ( -e $URL and -f $URL ) { # exists and is a file
+				if ( -z $URL ) { # has zero size
+					&Output ("       File size is zero:   $URL\n");
+				}
+			}
+			else {
+				&Output ("       File does not exist: $URL\n");
+			}
+		} # of if $Item->{LocalURL}
+	} # of foreach $Item
+} # of sub FileCheck
+
+
+####################################################################################################
+
+
+sub AOPFix { # adds the DOI to the pages field, if no start page or page range is given
+	my $Library = shift;
+	my ($Item, $Fix);
+	
+	&TaskHeader ("Checking ahead-of-print files\n");
+	
+	foreach $Item ( @{$Library} ) {
+		# ignore @comment and @string entries
+		if ($Item->{RefType} =~ m/^string$/i or $Item->{RefType} =~ m/^comment$/i) {
+			next;
+		}
+		
+		# dp (\@AOPFix);
+		
+		# check all user-defined conversions
+		foreach $Fix ( @AOPFix ) {
+			# all conditions have to be true
+			&CheckConditions (Instructions => $Fix, Item => $Item, AllTrue => 1);
+		} # of foreach $Fix ( @TypeConversions )
+	} # of foreach $Item
+} # of sub AOPFix
+
+
+####################################################################################################
+
+
+sub AuthorCorrections { # replaces the author names with the correct format as defined by the user
+	my $Library = shift;
+	my ($Item, $Index, $Line, @Fields, @Authors, $Authors, $AuthSep, $Substitution);
+	my ($Left, $Right, $Start, $End);
+	
+	# check whether author names have to be replaced
+	if ($AuthorNames and $Options->{autfix}) {
+		open AUTHORS, "<$AuthorNames" or die "$ERROR: Could not open file $AuthorNames: $!";
+		@Authors = <AUTHORS>;
+		close AUTHORS;
+	}
+	
+	foreach $Item ( @{$Library} ) {
+		$Index = GetIndex ($Item, "author");
+		
+		if (not defined $Index) { next }
+		
+		$Line = $Item->{Entry}[$Index];       # the regexes in the external file expect the string in $Line
+		foreach $Substitution ( @Authors ) {  # if not autfix then @Authors is empty...
+			eval $Substitution;                # execute the regular expression read from the file
+		}
+		
+		# if a maximum number of author names is defined
+		if ($Options->{autmax}) {
+			$Authors = FieldContent ($Line);
+			$Authors =~ s/\n/ /g;               # replace line feeds with blanks
+			
+			# determine the separator of the author names
+			if ($Authors =~ m/ and /) { $AuthSep = "and" }
+			elsif ($Authors =~ m/,/)  { $AuthSep = ","    }
+			
+			# only if any of the two possibilities are found the author list is tried to be split
+			if ($AuthSep) {
+				@Fields = split /\s+$AuthSep\s+/, $Authors;
+				
+				# if there are more authors than the threshold
+				if (scalar @Fields > $Options->{autmax}) {
+					# remove the last author until the wanted number is reached
+					pop @Fields until (scalar @Fields == $Options->{autmax});
+					# BibTeX will automatically replace the author "others" with "et al."
+					push @Fields, "others";
+					
+					# just to really keep everything as it was before, cut out everything
+					# until the first } and after the last }
+					$Left  = GetDelimiter ($Line, "left", "sub AuthorCorrections");
+					$Right = GetDelimiter ($Line, "right", "sub AuthorCorrections");
+					
+					$Start = substr $Line, 0, index ($Line, $Left)+1;
+					$End   = substr $Line, rindex ($Line, $Right);
+					
+					# glue the old start and end of line around the new, shortened author list
+					$Line = join " and ", @Fields;
+					$Line = $Start . $Line . $End;
+					$Item->{Entry}[$Index] = $Line;
+				}
+			} # of if ($AuthSep)
+		} # of if ($Options->{autmax})
+		
+		delete $Item->{AuthorList};
+		delete $Item->{FirstAuthor};
+		ParseAuthor ($Item, $Line);           # parse the authors again to get FirstAuthor and the AuthorList
+		$Item->{Entry}[$Index] = $Line;       # save the changed line
+	} # of foreach $Item ( @Library )
+} # of sub AuthorCorrections
+
+
+####################################################################################################
+
+
+sub RangeCorrection { # corrects abbreviated page ranges
+	my $Library = shift;
+	my ($Item, $Line, $Index, $StartPage, $EndPage, $Start, $End, $Left, $Right);
+	my ($Old, $New, $Temp, @PageCorrections, $Label);
+	
+	&TaskHeader ("Correcting page ranges\n");
+	
+	foreach $Item ( @{$Library} ) {
+		# check whether pages and an endpage is actually given, otherwise skip the item
+		if (not $Item->{Fields}{pages} or not $Item->{EndPage}) { next }
+		
+			# if the end page string is shorter than the start page
+		if ( (length $Item->{EndPage} < length $Item->{StartPage}) and 
+			# of no word characters are contained (important for page numbers like COMP-135)
+			($Item->{StartPage} !~ m/[A-Za-z]/ and $Item->{EndPage} !~ m/[A-Za-z]/) ) {
+			
+			$StartPage = $Item->{StartPage};
+			$EndPage   = $Item->{EndPage};
+			
+			$Old = "$StartPage-$EndPage";
+			
+			$Temp = substr $StartPage, 0, (length ($StartPage) - length ($EndPage));
+			$EndPage = "$Temp$EndPage";
+			
+			if ($Item->{Label}) { $Label = "($Item->{Label})" }
+			               else { $Label = ""                 }
+			
+			$New = "$StartPage-$EndPage";
+			push @PageCorrections, sprintf "%11s  =>  %11s   $Label", $Old, $New;
+			
+			$Item->{StartPage}     = $StartPage;
+			$Item->{EndPage}       = $EndPage;
+			$Item->{Fields}{pages} = "$StartPage"."-"."$EndPage";
+			
+			$Index = GetIndex ($Item, "pages");
+			$Line  = $Item->{Entry}[$Index];
+			
+			# just to really keep everything as it was before, cut out everything
+			# until the first } and after the last }
+			$Left  = GetDelimiter ($Line, "left", "RangeCorrection");
+			$Right = GetDelimiter ($Line, "right", "RangeCorrection");
+			
+			$Start = substr $Line, 0, index ($Line, $Left)+1;
+			$End   = substr $Line, rindex ($Line, $Right);
+			
+			$Line  = $Start . $Item->{Fields}{pages} . $End;
+			$Item->{Entry}[$Index] = $Line;
+		}
+	}
+	
+	if (@PageCorrections) {
+		&Output ("\n    The following page ranges have been expanded, please check the corrections:\n\n   ",
+		         join ("\n   ", @PageCorrections), "\n\n");
+	}
+} # of sub RangeCorrection
+
+
+####################################################################################################
+
+
+sub FormatLibrary { # aligns the item identifiers, equal signs, indents the entries and adds empty lines in between them
+	my $Library = shift;
+	my ($Item, $Line, $Index, $i, @Fields, $Field, $Content, $Label, $Blanks);
+	
+	&TaskHeader ("Formatting library\n");
+	
+	foreach $Item ( @{$Library} ) {
+		# change the letter case of the reference type (this affects the statistics)
+		if ($Options->{uc}) { $Item->{RefType} = uc $Item->{RefType} }
+		if ($Options->{lc}) { $Item->{RefType} = lc $Item->{RefType} }
+		
+		for $i ( 0 .. $#{$Item->{Entry}} ) {
+			$Line = $Item->{Entry}[$i];        # read the current line of the entry
+			# change the case of the type or field keyword if requesed
+			if ($Options->{uc} or $Options->{lc}) { $Line = &ChangeCase ($Line) }
+			
+			# if it is a BibTeX field, containing an equal sign
+			if ($Line !~ m/$ITEMTYPE/ and $Line =~ m/$FIELDTYPE/) {
+				$Field   = FieldName ($Line);
+				$Content = FieldContent ($Line);
+				
+				$Line =~ s/^\s+//;              # remove leading blanks (problem with split otherwise)
+				@Fields = split /=/, $Line, 2;  # split the $Line at the first equal sign in two parts
+				$Fields[0] =~ s/\s+$//;         # remove spaces after the field descriptor
+				
+				# if there was an equal sign contained in the line and therefore a second "half" exists
+				if (defined $Fields[1]) {
+					$Fields[1] =~ s/^\s+//;      # remove spaces before the field data starts
+					# Replace multiple spaces with only one in the item part.
+					# Mind that \s cannot be used as this also removes \n and would combine lines spread
+					# over multiple lines.
+					$Fields[1] =~ s/[ \t]+/ /g;
+				}
+				
+				if ($Options->{combine}) { # if lines should be combined concatenate the single lines
+					$Fields[1] =~ s/\n/ /g;
+					$Fields[1] =~ s/[ \t]+/ /g;  # replace multiple blanks with one (\s would also match \n)
+				}
+				
+				# add the requested number of leading blanks
+				for (1 .. $Options->{lb}) { $Fields[0] = " " . $Fields[0] }
+				
+				# if an equal sign was found and therefore $Fields[1] exists, combine them again with
+				# an equal sign
+				if (defined $Fields[1]) {
+					if ($Options->{wrap}) {
+						my $LineLength = $Options->{wrap} - $Options->{ep} - 2;
+						my @NewLines;
+						
+						if (length $Fields[1] > $LineLength) {
+							# replace multiple blanks with a single blank, this also replaces \n,
+							# the field is now on a single line
+							$Fields[1] =~ s/\s+/ /g;
+							my @Words = split /\s/, $Fields[1];  # split line at blanks
+							my $NewLine = "";        # this will be filled with words until the length is reached
+							
+							until (not @Words) {
+								# add the word of the line separated by blanks, this adds an additional blank to
+								# the beginning of the line, this is corrected later
+								$NewLine = $NewLine . " " . shift @Words;
+								
+								# if the maximum line length would be exceeded with the next word
+								if ($Words[0] and (length ($NewLine) + length ($Words[0]) > $LineLength) ) {
+									$NewLine = $NewLine . "\n";    # add a line feed to the current line
+									$NewLine =~ s/^\s+//;          # remove superfluous leading blanks
+									push @NewLines, $NewLine;      # add the current line to the previous ones
+									$NewLine = "";                 # and start anew
+								}
+							}
+							
+							# add the remainder
+							if ($NewLine) {
+								$NewLine =~ s/^\s+//;             # remove superfluous leading blanks
+								push @NewLines, $NewLine;
+							}
+							$Fields[1] = join "", @NewLines;
+						}
+					}
+					
+					# add blanks until the requested position for the equal sign is reached
+					while (length $Fields[0] < $Options->{ep}-1) {
+						$Fields[0] = $Fields[0] . " ";
+					}
+					
+					# create a string with as many blanks as needed for the indentation of multiple line entries
+					$Blanks = " "x $Options->{ep} . "  ";
+					
+					# replace all line feeds followed by a word character or a blank (i.e. not at the end
+					# of the line with a line feed followed by the indentation blanks
+					# (?=[\w ]) is a positive lookahead and matches, if a word character or blank is followed,
+					# but does not include the following character in the match
+					$Fields[1] =~ s/\n(?=[\w_\+\-"\(\)\[\]\ ])/\n$Blanks/g;
+					
+					$Line = $Fields[0] . "= " . $Fields[1];
+				}
+				else { # if no equal sign was found
+					# indentation is not wanted for the @type field and the last line of the entry
+					# with the last brace
+					if ($Line !~ m/^([\s\t]+)?@/ and $i != $#{$Item->{Entry}}) {
+						# add leading blanks until it is aligned to the opening-{ in the above line
+						for (0 .. $Options->{ep}-$Options->{lb}+1) {
+							$Fields[0] = " " . $Fields[0];
+						}
+						
+						$Line = $Fields[0];
+					}
+				}
+			} # of if ($Line =~ m/=/)
+			
+			$Item->{Entry}[$i] = $Line;  # save the changed line to the item array
+		} # of for $i
+	} # of foreach $Item ( @{$Library} )
+} # of sub FormatLibrary
+
+
+####################################################################################################
+
+
+sub ShortenLibrary {
+	my $Library = shift;
+	my ($Index, $Item, $Field);
+	
+	&TaskHeader ("Removing fields to be ignored\n");
+	
+	# For legacy reasons, to ensure backwards-compatibility. @IgnoreItems used to be the array holding
+	# field names that are to be filtered out. @IgnoreItems has been superseded by the %IgnoreFields hash,
+	# with $IgnoreFields{general} being the exact @IgnoreItems replacement and $IgnoreFields{reftype}
+	# holding fields that are to be ignored for a specific reference type.
+	if (@IgnoreItems and not $IgnoreFields{general}) {
+		$IgnoreFields{general} = \@IgnoreItems;
+	}
+	elsif (@IgnoreItems and $IgnoreFields{general}) {
+		&Output ("STDERR", "$ERROR: Problem in the configuration file. The \@IgnoreItems array is obsolete,\n"
+		                 . "         its purpose has been taken over by the \%IgnoreFields hash (more\n"
+		                 . "         particular by the {general} key in there).\n"
+		                 . "         Either \@IgnoreItems or \$IgnoreFields{general} may exist, both have\n"
+		                 . "         been found.\n\n");
+		exit 28;
+	}
+	
+	foreach $Item ( @{$Library} ) {
+		# Weeding out the entry lines has to be done after the reference types have been replaced.
+		# Some of the discarded fields may be needed for the type change (such as the URL field).
+		
+		# if the %IgnoreFields hash is defined and there is a key with the reference type of
+		# the current item, that is, for example, if for @misc there are specific items defined
+		# that are to be ignored instead of using the general list $IgnoreFields{general}
+		if ( %IgnoreFields and $IgnoreFields{ $Item->{RefType} } ) {
+			foreach $Field ( @{$IgnoreFields{ $Item->{RefType} }} ) {
+				$Field = lc $Field;                      # all hash keys are used lowercase in $Item->{Fields}
+				
+				if (defined $Item->{Fields}{$Field}) {   # if the current field is defined in $Item->{Fields}
+					delete $Item->{Fields}{$Field};       # delete the hash key
+					
+					$Index = GetIndex ($Item, $Field);    # determine the index of the line in $Item->{Entry}
+					
+					# delete the line from the array $Item->{Entry}
+					if ($Index) { splice @{$Item->{Entry}}, $Index, 1; }
+				}
+			} # of foreach $Field ( @{$IgnoreFields{ $Item->{RefType} }} )
+		}
+		# no list is defined for this special reference type, i.e. take the general list
+		elsif (%IgnoreFields and $IgnoreFields{general}) {
+			foreach $Field ( @{$IgnoreFields{general}} ) {
+				$Field = lc $Field;                      # all hash keys are used lowercase in $Item->{Fields}
+				
+				if (defined $Item->{Fields}{$Field}) {   # if the current field is defined in $Item->{Fields}
+					delete $Item->{Fields}{$Field};       # delete the hash key
+					
+					$Index = GetIndex ($Item, $Field);    # determine the index of the line in $Item->{Entry}
+					
+					# delete the line from the array $Item->{Entry}
+					if ($Index) { splice @{$Item->{Entry}}, $Index, 1; }
+				}
+			} # of foreach $Field ( @{$IgnoreFields{general}} )
+		} # of elsif ( %IgnoreFields and $IgnoreFields{ $Item->{RefType} } )
+	} # of foreach $Item ( @{$Library} )
+} # of sub ShortenLibrary
+
+
+####################################################################################################
+
+
+sub ProtectTitle { # encloses the titles in braces to keep BibTeX from changing the case
+	my $Library = shift;
+	my ($Item, $Index, $Line, $Field, $FirstDelimiter);
+	
+	foreach $Item ( @{$Library} ) {
+		if (not $Item->{Fields}{title}) { next }
+		$Line = $Item->{Fields}{title};
+		
+		if ($Line !~ m/^{/ and $Line !~ m/\}$/) {
+			# add the protecting braces to the field content
+			$Line = "{{$Line}},";
+			
+			# add the protected title to the parsed fields
+			$Item->{Fields}{title} = $Line;
+			
+			# determine the index of the title entry in the array
+			$Index = GetIndex ($Item, "title");
+			if (not defined $Index) { next }
+			
+			# determine the left delimiter and copy everything before it
+			$FirstDelimiter = GetDelimiter ($Item->{Entry}[$Index], "left", "ProtectTitle");
+			$FirstDelimiter = index ($Item->{Entry}[$Index], $FirstDelimiter);
+			
+			# copy the field definition ("  Title   =  ") to keep everything as untouched as possible
+			$Field = substr $Item->{Entry}[$Index], 0, $FirstDelimiter;
+			$Item->{Entry}[$Index] = "$Field$Line";
+		}
+		
+	} # of foreach $Item ( @{$Library} )
+} # of sub ProtectTitle
+
+
+####################################################################################################
+
+
+sub CreateStatistics { # reads all used authors, journals and reference types
+	my $Library    = shift;
+	my $Statistics = shift;
+	my ($Item, $Author);
+	
+	foreach $Item ( @{$Library} ) {
+		if ($Item->{RefType}) {
+			if (not $Statistics->{RefTypes}{ $Item->{RefType} }) {
+				$Statistics->{RefTypes}{ $Item->{RefType} } = 1;
+			}
+			else {
+				++$Statistics->{RefTypes}{ $Item->{RefType} };
+			}
+		}
+		else {
+			&Output ("No reference type found for ", &RefSummary ($Item));
+		}
+		
+		if ($Item->{AuthorList}) {
+			foreach $Author ( @{$Item->{AuthorList}} ) {
+				if (not $Statistics->{Authors}{$Author}) {
+					$Statistics->{Authors}{$Author} = 1;
+				}
+				else {
+					++$Statistics->{Authors}{$Author};
+				}
+			}
+		}
+		
+		if ($Item->{Fields}{journal}) {
+			if (not $Statistics->{Journals}{ $Item->{Fields}{journal} }) {
+				if (not $Statistics->{Journals}{ $Item->{Fields}{journal} }) {
+					$Statistics->{Journals}{ $Item->{Fields}{journal} } = 1;
+				}
+				else {
+					++$Statistics->{Journals}{ $Item->{Fields}{journal} };
+				}
+			}
+			else {
+				++$Statistics->{Journals}{ $Item->{Fields}{journal} };
+			}
+		}
+	} # of foreach $Item ( @{$Library} )
+} # of sub CreateStatistics
+
+
+####################################################################################################
+
+
+sub PrintTypeList { # prints out all found BibTeX types
+	my $Statistics = shift;
+	my ($Type);
+	
+	&TaskHeader ("List of reference types\n");
+	
+	foreach $Type ( sort keys %{$Statistics->{RefTypes}} ) {
+		&Output (sprintf "     %4d   $Type\n", $Statistics->{RefTypes}{$Type});
+	}
+	
+	&Output ("\n\n");
+} # of sub PrintTypeList
+
+
+####################################################################################################
+
+
+sub PrintAuthorList { # prints out all authors
+	my $Statistics = shift;
+	my (@Authors, $Author);
+	
+	&TaskHeader ("List of authors\n");
+	
+	@Authors = sort keys %{$Statistics->{Authors}};
+	
+	&Output ("      ", scalar @Authors, " different authors have been found.\n\n");
+	
+	if ($ShowSum) {
+		# to change the sorting order, exchange $a and $b
+		foreach $Author ( sort {$Statistics->{Authors}{$a} <=>
+		                        $Statistics->{Authors}{$b}} keys %{$Statistics->{Authors}} ) {
+			&Output ( sprintf "     %4d   $Author\n", $Statistics->{Authors}{$Author});
+		}
+	}
+	else {
+		foreach $Author ( sort keys %{$Statistics->{Authors}} ) {
+			&Output ("      $Author\n");
+		}
+	}
+	
+	&Output ("\n\n");
+} # of sub PrintAuthorList
+
+
+####################################################################################################
+
+
+sub PrintJournalList { # prints out all Journals
+	my $Statistics = shift;
+	my (@Journals, $Journal);
+	
+	&TaskHeader ("List of journals\n");
+	
+	@Journals = sort keys %{$Statistics->{Journals}};
+	
+	&Output ("      ", scalar @Journals, " different journals have been found.\n\n");
+	
+	if ($ShowSum) {
+		# to change the sorting order, exchange $a and $b
+		foreach $Journal ( sort {$Statistics->{Journals}{$a} <=>
+		                         $Statistics->{Journals}{$b}} keys %{$Statistics->{Journals}} ) {
+			&Output (sprintf "     %4d   $Journal\n", $Statistics->{Journals}{$Journal});
+		}
+	}
+	else {
+		foreach $Journal ( sort keys %{$Statistics->{Journals}} ) {
+			&Output ("      $Journal\n");
+		}
+	}
+	
+	&Output ("\n\n");
+} # of sub PrintJournalList
+
+
+####################################################################################################
+
+
+sub CheckAuthors { # checks the list of authors, whether the different parte (first, last, von, Jr) are separated correctly
+	my $Statistics  = shift;
+	my $AuthorNames = shift;
+	
+	my ($Author, @Authors, @Fields, $Field, @SpaceFields, @CommaFields, $Problems);
+	my (@VonInMiddle, @JrNotSeparated, @MoreThan3CommaFields, @JrAtEnd, @EmptyField, @WrongFirstNameField, @DoubleName, @Capitals);
+	
+	my $Indent  = "     ";
+	
+	my $JrPart  = "(Jr|Sen|1st|2nd|3rd|II|III|IV)\.?";
+	my $VonPart = "(von|von der|van|van der|del|de|de la|St|don|dos)";
+	
+	&TaskHeader ("Checking author name separators\n");
+	
+	@Authors = sort keys %{$Statistics->{Authors}};
+	
+	&Output ("      ", scalar @Authors, " different authors have been found.\n\n");
+	
+	foreach $Author ( @Authors ) {
+		$Author =~ s/^[\s\t]+|[\s\t]+$//g; # remove leading and trailing blanks or tabs
+		
+		if ($Author =~ m/,/) { # if the current author contains commas
+			# It should be like this:  "von Doe, Jr, John Jack Jim"
+			
+			@CommaFields = split /,\s*/, $Author; # split at commas and optional following blanks
+			
+			if    (scalar @CommaFields == 1) { # empty field
+				push @EmptyField, $Author;
+			}
+			elsif (scalar @CommaFields == 2) { # last names, first names
+				if ($CommaFields[0] =~ m/[\W][\w]\./) {
+					push @WrongFirstNameField, $Author;
+				}
+				
+				if ($CommaFields[0] =~ m/ $JrPart/i) {
+					push @JrNotSeparated, $Author;
+				}
+			}
+			elsif (scalar @CommaFields == 3) { # von last names, Jr, first names
+				if ($CommaFields[0] =~ m/ $JrPart/i) {
+					push @JrNotSeparated, $Author;
+				}
+				
+				if ($CommaFields[2] =~ m/$JrPart/i) {
+					push @JrAtEnd, $Author;
+				}
+			}
+			else { # WTF??? No idea what's going on here...
+				push @MoreThan3CommaFields, $Author;
+			}
+			
+			foreach $Field ( @CommaFields ) {
+				if (length $Field >= 2 and $Field =~ m/^[A-Z]+$/) {
+					push @Capitals, $Author;
+				}
+			}
+		}
+		else { # if the current author contains no commas (common Papers export error)
+			# This is OK:        "John F Doe"    or  "J F Doe"
+			# This can be wrong: "John van Doe"  or  "John Doe Jr"
+			
+			if ($Author =~ m/[\w\s\.]+ $VonPart [\w\s\.]+/i) {
+				push @VonInMiddle, $Author;
+			}
+			
+			if ($Author =~ m/[\w]\.? [\w][\w]+ [\w][\w]+/ and (not &InArray (\@VonInMiddle, $Author) ) ) {
+				push @DoubleName, $Author;
+			}
+			
+			if ($Author =~ m/ $JrPart$/i) {
+				push @JrNotSeparated, $Author;
+			}
+			
+			@SpaceFields = split /\s+/, $Author; # split at multiple spaces
+			
+			foreach $Field ( @SpaceFields ) {
+				if (length $Field >= 2 and $Field =~ m/^[A-Z]+$/) {
+					push @Capitals, $Author;
+				}
+			}
+		}
+	}
+	
+	if (@VonInMiddle or @JrNotSeparated or @MoreThan3CommaFields or @JrAtEnd or @EmptyField or
+		 @WrongFirstNameField or @DoubleName) {
+		$Problems = 1;    # you really got some issues, dude...
+	}
+	else {
+		$Problems = 0;    # nice job, happy TeXing...
+	}
+	
+	if (not $Problems) {
+		&Output ("$Indent No problems found (without guarantee, please check the author list using -autlist)...\n");
+		return;
+	}
+	
+	&Output ("$Indent Possible problems (depending on the chosen BibTeX style) have been found in the following names.\n");
+	if ($AuthorNames) {
+		&Output ("$Indent This check happens after the corrections defined the file $AuthorNames\n");
+	}
+	&Output ("\n");
+	
+	if (@VonInMiddle) {
+		&Output ("$Indent    -> \"von\" part in middle of the name (should be \"von Doe, John\"):\n\n",
+		         "$Indent$Indent  ",
+		         join ("\n$Indent$Indent  ", @VonInMiddle),
+		         "\n\n");
+	}
+	
+	if (@JrAtEnd) {
+		&Output ("$Indent    -> \"Jr\" part in the third comma-separated field (should be \"von Doe, Jr, John\"):\n\n",
+		         "$Indent$Indent  ",
+		         join ("\n$Indent$Indent  ", @JrAtEnd),
+		         "\n\n");
+	}
+	
+	if (@JrNotSeparated) {
+		&Output ("$Indent    -> \"Jr\" part not separated properly (should be \"Doe, Jr, John\" or at least \"John Doe, Jr\"):\n\n",
+		         "$Indent$Indent  ",
+		         join ("\n$Indent$Indent  ", @JrNotSeparated),
+		         "\n\n");
+	}
+	
+	if (@WrongFirstNameField) {
+		&Output ("$Indent    -> The first names are incorrectly separated, they should be in the last comma-separated field:\n\n",
+		         "$Indent$Indent  ",
+		         join ("\n$Indent$Indent  ", @WrongFirstNameField),
+		         "\n\n");
+	}
+	
+	if (@DoubleName) {
+		&Output ("$Indent    -> These names might contain double last names (it's hard to check for that robustly, better also check -autlist)\n\n",
+		         "$Indent$Indent  ",
+		         join ("\n$Indent$Indent  ", @DoubleName),
+		         "\n\n");
+	}
+	
+	if (@EmptyField) {
+		&Output ("$Indent    -> Here appears to be an empty field for some reason\n\n",
+		         "$Indent$Indent  ",
+		         join ("\n$Indent$Indent  ", @EmptyField),
+		         "\n\n");
+	}
+	
+	if (@MoreThan3CommaFields) {
+		&Output ("$Indent    -> More than 2 commas have been found, no idea what's going on there... (let me know!)\n\n",
+		         "$Indent$Indent  ",
+		         join ("\n$Indent$Indent  ", @MoreThan3CommaFields),
+		         "\n\n");
+	}
+	
+	if (@Capitals) {
+		&Output ("$Indent    -> Parts of these names are only in captial letters, this has to be corrected manually\n\n",
+		         "$Indent$Indent  ",
+		         join ("\n$Indent$Indent  ", @Capitals),
+		         "\n\n");
+	}
+} # of sub CheckAuthors
+
+
+####################################################################################################
+
+
+sub CheckTypes { # checks each reference whether required fields are missing
+	my $Library = shift;
+	my ($Item, @Fields, $RefType, $Req, $Opt, $Line);
+	my (@NoRefType, @UnknownRefType, @ReqMissing, @BothPresent);
+	my $Indent  = "   ";
+	
+	&TaskHeader ("Checking reference type fields\n");
+	
+	foreach $Item ( @{$Library} ) {
+		if (not $Item->{RefType}) { push @NoRefType, &RefSummary ($Item) }
+		if (not $RefTypes->{ $Item->{RefType} }) { push @UnknownRefType, &RefSummary ($Item) }
+		
+		$RefType = $Item->{RefType};
+		
+		foreach $Req ( @{$RefTypes->{$RefType}{Req}} ) { # check required fields
+			if ($Req =~ m/-or-/) {
+				@Fields = split /-or-/, $Req;
+				
+				# test if none of the two fields is present
+				if (not $Item->{Fields}{$Fields[0]} and not $Item->{Fields}{$Fields[1]}) {
+					$Line = &RefSummary ($Item);
+					$Line = $Line . "($Fields[0] or $Fields[1])";
+					push @ReqMissing, $Line;
+				}
+				# test if both of the two fields is present
+				elsif ($Item->{Fields}{$Fields[0]} and $Item->{Fields}{$Fields[1]}) {
+					$Line = &RefSummary ($Item);
+					$Line = $Line . "($Fields[0] and $Fields[1]) present";
+					push @BothPresent, $Line;
+				}
+			}
+			elsif ($Req =~ m/-andor-/) {
+				@Fields = split /-andor-/, $Req;
+				
+				# test if none of the two fields is present
+				if (not $Item->{Fields}{$Fields[0]} and not $Item->{Fields}{$Fields[1]}) {
+					$Line = &RefSummary ($Item);
+					$Line = $Line . "($Fields[0] and/or $Fields[1])";
+					push @ReqMissing, $Line;
+				}
+			}
+			else {
+				if (not $Item->{Fields}{$Req}) {
+					$Line = &RefSummary ($Item);
+					$Line = $Line . "   ($Req)";
+					push @ReqMissing, $Line;
+				}
+			}
+		}
+	}
+	
+	
+	if (@NoRefType) {
+		&Output ("$Indent  -> No reference type has been found or recognized, this may be due to a format error\n\n",
+		         "$Indent",
+		         join ("\n\n$Indent$Indent  ", @NoRefType),
+		         "\n\n");
+	}
+	
+	if (@UnknownRefType) {
+		&Output ("$Indent  -> Unknown reference type\n\n",
+		         "$Indent",
+		         join ("\n\n$Indent", @UnknownRefType),
+		         "\n\n");
+	}
+	
+	if (@ReqMissing) {
+		&Output ("$Indent  -> Required field is missing\n\n",
+		         "$Indent",
+		         join ("\n\n$Indent", @ReqMissing),
+		         "\n\n");
+	}
+	
+	if (@BothPresent) {
+		&Output ("$Indent  -> Both possibilities of an \"or\" requirement present\n\n",
+		         "$Indent",
+		         join ("\n\n$Indent", @BothPresent),
+		         "\n\n");
+	}
+} # of sub CheckTypes
+
+
+####################################################################################################
+
+
+sub ConvertDelimiters { # converts the field delimiters to either braces or quotes
+	my $Library = shift;
+	my ($Item, $Index, $Delimiter, $i);
+	
+	foreach $Item ( @{$Library} ) {
+		foreach $Index ( 1 .. $#{$Item->{Entry}} ) { # ignore the @item line
+			$Line = $Item->{Entry}[$Index];
+			
+			if ($Line !~ m/$FIELDTYPE/) { next }
+			
+			$Delimiter = GetDelimiter ($Line, "left", "ConvertDelimiters");
+			
+			if ($Options->{braces} and $Delimiter eq '"') {
+				# count the double quotes and hash symbols (#)
+				my $QuoteCount = $Line =~ s/"/"/g;
+				my $HashCount  = $Line =~ s/#/#/g;
+				
+				# If BibTeX strings are used within the field, thez have to be enclosed in hash
+				# symbols:
+				# author = "I and myself "# string #" and me as well"
+				#
+				# If the beginning and end quotes were replaced by braces in the above line, the
+				# entry would become invalid. Therefore, if more than two quotes and more than
+				# one hash symbol is found, the line is ignored.
+				if ($QuoteCount > 2 and $HashCount > 1) { next }
+				
+				$i = index ($Line, '"');
+				substr ($Line, $i, 1) = "{";
+				
+				$i = rindex ($Line, '"');
+				substr ($Line, $i, 1) = '}';
+				
+				$Item->{Entry}[$Index] = $Line;
+			}
+			elsif ($Options->{quotes} and $Delimiter eq "{") {
+				# If the line contains quotation marks the line is ignored, that is the braces
+				# are kept as delimiters.
+				if ($Line =~ m/"/) { next }
+				
+				$i = index ($Line, '{');
+				substr ($Line, $i, 1) = '"';
+				
+				$i = rindex ($Line, '}');
+				substr ($Line, $i, 1) = '"';
+				
+				$Item->{Entry}[$Index] = $Line;
+			}	
+		}
+	} # of foreach $Item ( @{$Library} )
+} # of sub ConvertDelimiters
+
+
+####################################################################################################
+
+
+sub ChangeCase { # changes the case of the type and field keyword
+	my $Line = shift;
+	
+	if ($Options->{lc}) {
+		# ([\s\t]+)?   optional multiple blanks or tabs (this goes into $1)
+		# \@([\w-]+)   an @ followed by multiple word characters and dashes, saved into $2
+		# ([\s\t]+)?   optional multiple blanks or tabs (this goes into $3)
+		# \{           a left brace
+		$Line =~ s/^([\s\t]+)?\@([\w-]+)([\s\t]+)?\{/\@\L$2\{/;
+		$Line =~ s/^([\s\t]+)?([\w-]+)([\s\t]+)?=/\L$2=/;
+		# &Output ($Line);
+	}
+	elsif ($Options->{uc}) {
+		$Line =~ s/^([\s\t]+)?\@([\w-]+)([\s\t]+)?\{/\@\U$2\{/;
+		$Line =~ s/^([\s\t]+)?([\w-]+)([\s\t]+)?=/\U$2=/;
+		# &Output ($Line);
+	}
+	
+	return $Line;
+} # of sub ChangeCase
+
+
+####################################################################################################
+
+
+sub CheckConditions { # carries out instructions depending on a set of conditions
+	my %args = @_;
+	
+	my $Instructions = $args{Instructions};
+	my $Item         = $args{Item};
+	my $Files        = $args{Files};
+	my $AllTrue      = $args{AllTrue}; # 1 if all conditions need to be true
+	                                   # 0 if only one condition needs to be true
+	my ($FileContent, $Condition, $OK, $Field, $Value, $True, $Change, $OneTrue);
+	
+	if ($AllTrue) { $OneTrue = 0 }
+	         else { $OneTrue = 1 }
+	
+ 	# If all the conditions have to be true, it is initially assumed that the fix is performed.
+	# If one of the conditions defined for this is not satisfied, $OK will be set false.
+	if ($AllTrue) { $OK = 1; } # "AND" decision
+	# If only one condition needs to be true for the fix to be carried out it is first assumed
+	# that the conversion is not performed. If one of the conditions defined for this conversion
+	# is satisfied, $OK will be set true.
+	         else { $OK = 0; } # "OR" decision
+	
+	foreach $Condition ( @{$Instructions->{Conditions}} ) {
+		$Field = $Condition->{Field};
+		$Value = $Condition->{Value};
+		$True  = $Condition->{True};
+		
+		# The fix is carried out if ANY ONE of the given conditions is satisfied
+		# (i.e. it is an "or" decision. This is achieved by $OK, which is set true
+		# and the loop is left upon the first positive match.
+		#
+		# If a value is given that matches 'infile', then it is an instruction to
+		# read the given file and compare the contained values with the field
+		# In the configuration file this looked like
+		#    IF  journal, infile(foo.cfg)
+		if (defined $Value and $Value =~ m/infile/i) {
+			$FileContent = &ReadInFileInstruction ($Value, $Files);
+					
+			# run over each string read from the file
+			foreach $Value ( @{$FileContent} ) {
+				# the string comparisons are done case-insensitively (uc = uppercase)
+				#
+				# if the reference type matches a string
+				if ($True and $Field eq "RefType"
+					       and uc($Item->{RefType}) eq uc($Value) ) {
+					if ($OneTrue) { $OK = 1; last; }
+				}
+				# if the reference type does not match a string
+				elsif (not $True and $Field eq "RefType"
+					              and uc($Item->{RefType}) ne uc($Value) ) {
+					if ($OneTrue) { $OK = 1; last; }
+				}
+				# if a particular field matches a string
+				elsif ($True and $Item->{Fields}{$Field}
+					          and uc($Item->{Fields}{$Field}) eq uc($Value) ) {
+					if ($OneTrue) { $OK = 1; last; }
+				}
+				# if a particular field does not match a string
+				elsif (not $True and $Item->{Fields}{$Field}
+					              and uc($Item->{Fields}{$Field}) ne uc($Value) ) {
+					if ($OneTrue) { $OK = 1; last; }
+				}
+			}
+		} # of if (defined $Value and $Value =~ m/infile/i)
+		#
+		# If a value is given that did not match 'infile', it is a regular
+		# expression check. In the file this looked like, for example
+		#    IF   RefType, ^Misc$
+		elsif (defined $Value) {
+			# if the reference type matches a regex
+			if ($True and $Field eq "RefType") {
+				if ($Item->{RefType} =~ m/$Value/i) {
+					if ($OneTrue) { $OK = 1; last; }
+				}
+			}
+			# if the reference type does not match a regex
+			elsif (not $True and $Field eq "RefType") {
+				if (not $Item->{RefType} =~ m/$Value/i) {
+					if ($OneTrue) { $OK = 1; last; }
+				}
+				else {
+					if ($AllTrue) { $OK = 0 }
+				}
+			}
+			# if a particular field matches a regex
+			elsif ($True and $Item->{Fields}{$Field}) {
+				if ($Item->{Fields}{$Field} =~ m/$Value/i) {
+					if ($OneTrue) { $OK = 1; last; }
+				}
+			}
+			# if a particular field does not match a regex
+			elsif (not $True and $Item->{Fields}{$Field}) {
+				  if (not $Item->{Fields}{$Field} =~ m/$Value/i) {
+					if ($OneTrue) { $OK = 1; last; }
+				}
+			}
+		}
+		#
+		# If no value is given, it is a "defined or not" condition.
+		# In the file this looked like
+		#    IF   pages
+		else {
+			# if a particular field exists
+			if ($True and defined $Item->{Fields}{$Field}) {
+				if ($OneTrue) { $OK = 1; last; }
+			}
+			# if a particular field does not exist
+			elsif (not $True and not defined $Item->{Fields}{$Field}) {
+				if ($OneTrue) { $OK = 1; last; }
+			}
+		}
+	} # of foreach $Condition ( @{$Instructions->{Conditions}} )
+	
+	# if one of the conditions necessary for the replacements has been satisfied
+	if (not $OK) { return; }
+	else {
+		foreach $Change ( @{$Instructions->{Changes}} ) {
+			if ($Change->{Delete}) {
+				DeleteField ($Item, $Change->{Delete});
+			}
+			elsif ($Change->{Replace}) {
+				ReplaceType ($Item, $Change->{Replace},  $Change->{With});
+			}
+		}
+	}
+} # of sub CheckConditions
+
+
+####################################################################################################
+
+
+sub ReadInFileInstruction { # reads the file defined with 'infile'
+	my $Value = shift;
+	my $Files = shift;
+	
+	my ($File, @Content);
+	
+	# check the syntax of the instruction
+	#   ^infile    'infile' at the beginning of the string
+	#   \(         a left parenthesis
+	#   [^)]+      multiple characters that are not a right parenthesis
+	#   \)$        a right parenthesis at the end of the string
+	if ($Value !~ m/^infile\([^)]+\)$/i) {
+		&Output ("STDERR", "\nERROR: Could not interpret the TypeFix instruction\n" .
+		         "           $Value in file $Configuration.\n" .
+		         "       The correct syntax is, for example\n" .
+		         "           IF   journal, infile(filename)\n\n");
+		exit 24;
+	}
+	else { # extract the filename
+		my $File = $Value;
+		# extract the filename
+		#    ^        the beginning of the line
+		#    infile   the string infile (case insensitive)
+		#    \(       a left parenthesis
+		#    (        this saves everything between the parentheses in $1
+		#      [^)]+  multiple characters that are not ")"
+		#    )
+		#    \)$      a right parenthesis at the end of the string
+		$File =~ s/^infile\(([^)]+)\)$/$1/i;
+		
+		# if the variable $ScriptLocation is contained in the path, exchange it with the
+		# actual value
+		$File =~ s/\$ScriptLocation/$ScriptLocation/;
+		
+		if (not -f $File) { # check the file for existence
+			# Set the hash entry of the filename true. Due to the hash each filename
+			# is only printed once. If an array were used, the filename would be
+			# printed for each library item.
+			$Files->{NotFound}{$File} = 1;
+			return []; # return an empty array reference
+		}
+		else {
+			if ($Files->{Found}{$File}) {
+				return $Files->{Found}{$File};
+			}
+			else {
+				# if the file exists, parse the contents
+				my (@Content, $Line, @Fields, $i);
+				my @Strings;
+				
+				open FILE, "<$File" or die "$ERROR: Could not open file $File: $!";
+				@Content = <FILE>;
+				close FILE;
+				
+				# The file can contain a string on each line or, as in the case of the
+				# abbreviation files, tab-delimited strings. If there are tabs, then the
+				# line is split into the columns and each string added individually.
+				while (@Content) {
+					$Line = shift @Content;        # read the next line
+					@Fields = split /\t+/, $Line;  # split the line using tabs as delimiters
+					
+					for $i ( 0 .. $#Fields ) {
+						# remove leading and trailing blanks
+						if ($Fields[$i]) { $Fields[$i] =~ s/^[\s\t]+|[\s\t]+$//g; }
+						push @Strings, $Fields[$i];
+					}
+				} # of while (@Content)
+				
+				# save the reference to the array with the file content for later
+				# iterations (to avoid parsing a file multiple times)
+				$Files->{Found}{$File} = \@Strings;
+				# and now return the file content for this itertion
+				return \@Strings;
+			} # of else if ($Files->{Found}{$File})
+		} # of else if (not -f $File)
+	}
+} # of sub ReadInFileInstruction
+
+
+####################################################################################################
+
+
+sub InArray { # returns true, if the string is already in the array
+	my $RefArray = shift;
+	my $String = shift;
+	my $i;
+	
+	for $i (0 .. $#{$RefArray}) {
+		if ($String eq $RefArray->[$i]) { return 1 } # if the string is found, return true
+	}
+	
+	return 0; # else return false
+} # of sub InArray
+
+
+####################################################################################################
+
+
+sub TaskHeader { # to ensure a uniform header for the tasks
+	my $Task = shift;
+	
+	# &Output ("================================================================================\n");
+	
+	if ($Task) { &Output (" => "); }
+	&Output ($Task);
+	if ($Task) { &Output ("    "); }
+	
+	for (2 .. length $Task) { &Output ("-"); }
+	&Output ("\n");
+} # of sub TaskHeader
+
+
+sub SmallHeader { # for short tasks which usually don't produce any further output
+	my $Task = shift;
+	
+	&Output (" => ", $Task);
+} # of sub SmallHeader
+
+
+####################################################################################################
+
+
+sub CleanString { # removes all BibTeX codes from the label
+	my $Label = shift;
+	
+	# This may be encountered if no second abbreviation (abb2) is given the abbreviation file. In that
+	# case "something" must be returned in order to avoid an error message
+	if (not $Label) { return "" }
+	
+	# &Output ("In:  $Label\n");
+	
+	# search for
+	# \{          a left brace
+	# \\          followed by a backslash
+	# .           followed by any character
+	# ( )?        followed by an optional blank => backreference $1
+	# (\\)?       followed by an optional backslash => backreference $2
+	# (\w)        then a word character => backreference $3
+	# \}          and a right brace
+	$Label =~ s/\{\\.( )?(\\)?(\w)\}/$3/g;     # {\'e} or {\' e} or {\'\e} => e
+	
+	# search for
+	#   \\        a backslash
+	#   ["'`^~cv] followed by one character of "'`^~cv
+	#   \{        followed by {
+	#   \w        then a word character => backreference $1
+	#   \}        followed by }
+	# and replace it with
+	#   $1        the saved word character
+	$Label =~ s/\\["'`^~cv]\{(\w)\}/$1/g;      # remove several symbol commands, e.g. the \'{} around \'{e}
+	
+	# search for
+	#   \\        a backslash
+	#   \{        followed by {
+	#   ["'`^~cv] followed by one character of "'`^~cv
+	#   \w        then a word character => backreference $1
+	#   \}        followed by }
+	# and replace it with
+	#   $1        the saved word character
+	$Label =~ s/\\\{["'`^~cv](\w)\}/$1/g;      # \{'e} => e
+	
+	$Label =~ s/[\\'\(\)~"^`]//g;                  # remove other stuff which doesn't belong in there
+	
+	# &Output ("Out: $Label\n");
+	
+	return $Label;
+} # of sub CleanString
+
+
+####################################################################################################
+
+
+sub RefSummary { # creates a short summary of a given reference
+	my $Ref = shift;
+	
+	my ($Line, $Key, $Title);
+	
+	if ($Ref->{Label})           { $Line = $Line . "    $Ref->{Label}\n       ";     }
+	if ($Ref->{Fields}{journal}) { $Line = $Line . "$Ref->{Fields}{journal}, ";      }
+	if ($Ref->{Fields}{pages})   { $Line = $Line . "$Ref->{Fields}{pages}, ";        }
+	if ($Ref->{Fields}{year})    { $Line = $Line . "$Ref->{Fields}{year}";           }
+	
+	if ($Ref->{FirstAuthor} or $Ref->{Fields}{title}) { $Line = $Line . "\n       "; }
+	
+	if ($Ref->{FirstAuthor})   { $Line = $Line . "$Ref->{FirstAuthor}, ";            }
+	if ($Ref->{Fields}{title}) {
+		$Title = $Ref->{Fields}{title};
+		$Title =~ s/\n/ /g;
+		$Line = $Line . $Title;
+	}
+	
+	if (not $Line) { # worst case, nothing found, total disaster
+		$Line = "    ";
+		
+		foreach $Key ( keys %{$Ref->{Fields}} ) {
+			$Line = $Line . $Ref->{Fields}{$Key} . "\n      ";
+		}
+	}
+	
+	return $Line;
+} # of sub RefSummary
+
+
+####################################################################################################
+
+
+sub Output { # prints to STDOUT, STDERR or a log file
+	my @Args = @_;
+	
+	if ($Options->{log}) {
+		if ($Args[0] eq "STDERR") { shift @Args }
+		
+		open  LOG, ">>$Options->{log}" or die "$ERROR: Could not open logfile $Options->{log}: $!";
+		print LOG join "", @Args;
+		close LOG;
+	}
+	elsif ($Args[0] eq "STDERR") {
+		shift @Args;
+		print STDERR join "", @Args;
+	}
+	else {
+		print join "", @Args;
+	}
+} # of sub Output
+
+
+####################################################################################################
+
+
+sub ReadConfigurationFile { # parses the configuration file
+	my (@Content, $Line, $RefType, $Items);
+	
+	# The user may provide the configuration file via the -conf  parameter.
+	# This was implemented to be able to have different configurations, e.g. for different
+	# libraries for papers, a thesis, etc.
+	if ($Options->{conf}) { $Configuration = $Options->{conf} }
+	
+	# In Revision 4989 (end of Feb 2011) the extension .cfg was added to all configuration files.
+	# This is no problem for the files defining substitutions, authors, and abbreviations as these
+	# are defined in the main configuration file itself. However, the latter is not found if users
+	# upgrade and do not add the extension to their configuration file. It is, therefore, checked
+	# if a file without the extension is found.
+	if (not -f $Configuration) {
+		my $Temp = $Configuration;
+		$Temp =~ s/\.cfg$//;
+		if (-f $Temp) { $Configuration = $Temp }
+		else {
+			&Output ("STDERR", "\nWARNING: Configuration file $Configuration is defined\n"
+			          . "         in the source but does not exist. The configuration defined in the\n"
+			          . "         source code of the script is used instead.\n\n");
+			return;
+		}
+	}
+	
+	open CONFIG, "<$Configuration" or die "$ERROR: Could not open configuration file $Configuration: $!";
+	@Content = <CONFIG>;
+	close CONFIG;
+	
+	my $LineCount = 0;
+	
+		while ( @Content ) {
+		$Line = shift @Content;
+		++$LineCount;
+		
+		# skip comment lines
+		if ($Line =~ m/^\s*#/) { next }
+		
+		# if the line starts with "->" but no colon follows until the end of the line
+		if ($Line =~ m/^->\s*[^:]+$/) {
+			&Output ("STDERR", "$ERROR:\n"
+			                 . "The line $LineCount in the configuration file $Configuration starts\n"
+			                 . "with '->' but no colon follows until the end of the line.\n\n");
+			exit 32;
+		}
+		# if the line starts with -> and the 'IgnoreFields' keyword
+		elsif ($Line =~ m/^->\s*IgnoreFields\s*:/i) {
+			until (not @Content or $Line =~ m/^END/) {
+				$Line = shift @Content;
+				++$LineCount;
+				$Line =~ s/^\s*|\s*$//g; # remove leading and trailing blanks
+				
+				# this is technically the main termination point
+				if (not $Line or $Line =~ m/^END/) { last }
+				
+				if ($Line =~ m/^->\s*\w+\s*:/i) {
+					&Output ("STDERR", "$ERROR:\n"
+					       . "The line $LineCount in the configuration file $Configuration\n"
+					       . "starts a new configuration block before the last block (-> IgnoreFields)\n"
+					       . "was ended with the END keyword.\n\n");
+					exit 34;
+				}
+				
+				# check the line format:
+				#    ^\s*         Optional multiple blanks at the line start
+				#    \@?          Possibly (but not necessarily) an @
+				#    [\w\-]+      multiple word characters or hyphens
+				#    :            a colon
+				#    [\s,\w\-]+$  a series of blanks, commas, word characters and hyphens before the EOL
+				if ($Line !~ m/^\s*\@?[\w\-]+:[ ,\w\-]+$/) {
+					&Output ("STDERR", "$ERROR:\n"
+					                 . "The line $LineCount in the configuration file $Configuration is an\n"
+					                 . "entry to ignore specific fields of a BibTeX item. There is\n"
+					                 . "a format error, the required format is\n\n"
+					                 . "\@misc: note, abstract, keywords\n\n");
+					exit 35;
+				}
+				
+				my @Fields;                            # need a new variable for each reference tyoe
+				$Line    =~ s/\s+//g;                  # remove all blanks from the line
+				$Line    =  lc $Line;                  # format the whole line lowercase
+				@Fields  =  split /:/, $Line, 2;       # split the line at the first colon in 2 fields
+				
+				$RefType =  shift @Fields;
+				$RefType =~ s/^[\s\@]*|\s*$//g;        # remove leading and trailing blanks and the @
+				
+				$Items   =  shift @Fields;             # read the line with the comma-separated items
+				@Fields  =  split /,/, $Items;         # split at commas
+				$IgnoreFields{$RefType} = \@Fields;    # save the reference to the array
+				
+				my @AdditionalFields;
+				
+				# read additional lines that belong to the same entry
+				until (not @Content       # all lines are used up
+				         or $Content[0] =~ m/^END/   # or there's an END in the next line
+						or $Content[0] =~ m/^\s*\@?[\w\-]+:/) { # or a new RefType defintion starts
+					$Line    =  shift @Content;             # read the next line
+					$Line    =~ s/\s+//g;                   # remove all blanks from the line
+					$Line    =  lc $Line;                   # format the whole line lowercase
+					@AdditionalFields  =  split /,/, $Line; # split the line at the first colon in 2 fields
+					push @{$IgnoreFields{$RefType}}, @AdditionalFields;
+				}
+			} # of until (not @Content or not $Line or $Line =~ m/^END/)
+		
+		} # of elsif ($Line =~ m/^->\s*IgnoreFields\s*:/i)
+		elsif ($Line =~ m/^->\s*TypeFix\s*:/i) {
+			my $Block = &ReadReplacementBlock (\@Content, \@TypeConversions, \$LineCount);
+			my ($Change);
+			my $RefTypeReplaced = 0;
+			
+			# The following check whether the reference type actually gets replaced was removed.
+			# The function to replace stuff depending on multiple conditions is quite powerful and
+			# it was chosen not to restrict it to reference type changes only.
+			#
+			# foreach $Change ( @{$Block->{Changes}} ) {
+			# 	if (defined $Change->{Replace} and $Change->{Replace} eq "RefType") {
+			# 		$RefTypeReplaced = 1;
+			# 	}
+			# }
+			# 	
+			# if (not $RefTypeReplaced) {
+			# 		&Output ("STDERR", "$ERROR:\nIncomplete instructions in the configuration file "
+			# 		   . "$Configuration at line $$LineCount.\n"
+			# 		   .  "A replacement for the reference type of a processed item is expected, the\n"
+			# 		   .  "keyword 'RefType' is parsed case sensitively. Example:\n\n"
+			# 		   .  "REPLACE  RefType , \@book\n\n");
+			# 		print Dumper $Block;
+			# 		exit 46;
+			# }
+		}
+		elsif ($Line =~ m/^->\s*AOPFix\s*:/i) {
+			&ReadReplacementBlock (\@Content, \@AOPFix, \$LineCount);
+		}
+		else {
+			# if a variable is set that is usually given via the command line and stored in $Options
+			if ($Line =~ m/\$Options->{/) {
+				# cut out the option from the line (e.g. "$Options->{ep}" => "ep"
+				my $Option = $Line;
+				$Option =~ s/^\s*\$Options->{([a-zA-Z0-9]+)}.+\s*$/$1/;
+				#
+				# if the option was NOT given via the command line (which would override the configuration
+				# file value)
+				if (not $Options->{GivenParams}{$Option}) {
+					eval $Line;
+				}
+			}
+			else {
+				# execute the line read from the configuration file
+				eval "$Line";
+			}
+		}
+	} # of while ( @Content )
+	
+	# dp (\@TypeConversions);
+	# dp (\@AOPFix);
+	# dp (\%IgnoreFields);
+} # of sub ReadConfigurationFile
+
+
+####################################################################################################
+
+
+sub ReadReplacementBlock {
+	my $Content   = shift;
+	my $Array     = shift;
+	my $LineCount = shift;
+	
+	# create a hash reference for this particular typefix
+	my $Instructions = {
+		Conditions => [],
+		Changes => [],
+	};
+	
+	my $True;      # used to remember whether the condition should be true or false
+	my $Line = 1;  # just a true value to start with
+	
+	until (not @{$Content} or not $Line or $Line =~ m/^END/) {
+		$Line = shift @{$Content};
+		++$$LineCount;
+		$Line =~ s/^\s*|\s*$//g; # remove leading and trailing blanks
+		
+		# skip comment lines
+		if ($Line =~ m/^\s*#/) { next }
+		
+		# this is technically the main termination point
+		if (not $Line or $Line =~ m/^END/) { last }
+		
+		# if it's a condition to trigger the typefix
+		if ($Line =~ m/^IF /i) {
+			$Line =~ s/^IF\s+//i;                # remove the leading IF and following blanks
+			
+			if ($Line =~ m/^NOT /i) { $True = 0; }
+			                   else { $True = 1; }
+			
+			$Line =~ s/^NOT\s*//;
+			@Fields = split /\s*,\s*/, $Line, 2; # split the line at the first comma in 2 fields
+			
+			# The reference types are stores without the leading @. If the user entered it, it
+			# is removed. Otherwise comparisons would fail (article != @article).
+			if ($Fields[1] and $Fields[0] =~ m/RefType/i) {
+				$Fields[1] =~ s/@//g;
+			}
+			
+			push @{$Instructions->{Conditions}}, {
+				Field => $Fields[0],
+				True  => $True,
+				Value => $Fields[1],
+			};
+		}
+		# if it's an instruction to replace something with something else
+		elsif ($Line =~ m/^REPLACE /i) {
+			$Line =~ s/^REPLACE\s+//i;    # remove the leading REPLACE and following blanks
+			@Fields = split /\s*,\s*/, $Line, 2;
+			
+			if (scalar @Fields != 2) {
+				&Output ("STDERR", "$ERROR:\n"
+				   . "The line $$LineCount in the configuration file $Configuration contains\n"
+				   . "a replace instruction but did not split into two items. The required format is\n\n"
+				   . "   REPLACE  old field , new field\n\n"
+				   . "where 'field' is a BibTeX entry field name such 'volume'\n\n");
+				exit 42;
+			}
+			
+			push @{$Instructions->{Changes}}, {
+				Replace => $Fields[0],
+				With    => $Fields[1],
+			};
+		}
+		# if it's an instruction to delete a field
+		elsif ($Line =~ m/^DELETE /i) {
+			$Line =~ s/^DELETE\s+//i;     # remove the leading DELETE and following blanks
+			@Fields = split /\s*,\s*/, $Line;
+			
+			foreach my $Field ( @Fields ) {
+				push @{$Instructions->{Changes}}, { Delete => $Field };
+			}
+		}
+		elsif ($Line =~ m/^END/i) {
+			last;
+		}
+		else {
+			&Output ("STDERR", "$ERROR:\nCould not interpret line $$LineCount in the configuration file "
+			   . "$Configuration.\n"
+			   . "Only the keywords 'IF', 'DELETE', and 'REPLACE' are known and the entry\n"
+			   . "must be finished with the 'END' keyword.\n\n"
+			   . "     $Line\n\n");
+			exit 44;
+		}
+	}
+	
+	# dp ($Instructions);
+	
+	push @{$Array}, $Instructions;
+	return $Instructions;
+} # of sub ReadReplacementBlock
+
+
+
+
+
+
+
+
+
+
+
+
+# There's nothing more down here. Go back up and read it again.
+
+
+
+
+
+
+
+
+
+
+
+
+
+# I'm not kidding, it's over!
+

@@ -1,0 +1,387 @@
+#!/usr/bin/perl -w
+
+####################################################################################################
+#
+# Program:    install
+#
+# Function:   Copies all necessary files and Perl libraries for the script bibtexformat
+#
+# Author:     Benjamin Bulheller
+#
+# Website:    www.bulheller.com
+#
+# Date:       January 2009
+#
+# Version:    $Revision: 4082 $, $Date: 2009-03-10 11:50:47 +0000 (Tue, 10 Mar 2009) $
+#
+# Licence:    Copyright 2009 Benjamin Bulheller
+#
+#             This program is free software: you can redistribute it and/or modify
+#             it under the terms of the GNU General Public License as published by
+#             the Free Software Foundation, either version 2 of the License, or
+#             (at your option) any later version.
+#
+#             This program is distributed in the hope that it will be useful,
+#             but WITHOUT ANY WARRANTY; without even the implied warranty of
+#             MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#             GNU General Public License for more details.
+#
+#             You should have received a copy of the GNU General Public License
+#             along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+####################################################################################################
+
+use strict;                          # always use this!!!
+use Data::Dumper;                    # for easy printout of arrays and hashes
+use FindBin qw/$Bin/;                # sets $Bin to the directory of the script
+use lib $Bin;                        # add the script's directory to the library path
+use lib "$ENV{HOME}/bin/perllib/";   # adds ~/bin/perllib to the library path
+use File::Copy;                      # to copy and move files
+use DebugPrint;
+
+my ($Path, $Dir, $Answer, $Line, @ScriptContent, $ConfigurationPath, $ConfigPathOK);
+
+# check whether all necessary files are in the current directory
+&CheckFile ("ParseBibTeX.pm");
+&CheckFile ("GetParameters.pm");
+&CheckFile ("DebugPrint.pm");
+&CheckFile ("bibtexformat");
+&CheckFile ("bibtexformat.pdf");
+&CheckFile ("formatlib");
+&CheckFile ("authors");
+&CheckFile ("configuration.cfg");
+&CheckFile ("abbreviations.cfg");
+&CheckFile ("substitutions.cfg");
+&CheckFile ("PapersToBibTeXformat.scpt");
+
+################################################################################
+
+$Path = shift;
+
+if (not $Path) { $Path = "$ENV{HOME}/bin/bibtexformat" }
+
+print <<EOF;
+
+
+bibtexformat - BibTeX Library Handling
+--------------------------------------
+
+(c) Benjamin Bulheller, please see source for licence
+    http://www.bulheller.com
+
+Usage:   install  <directory>
+  e.g.   install  ~/bin/bibtexformat
+
+         If no directory is provided, ~/bin/bibtexformat is chosen by default.
+
+
+ =>  This installation script copies the following files:
+
+     to $Path:
+        bibtexformat              (the script itself)
+        formatlib                 (run script with the user's favorite parameters)
+        bibtexformat.pdf          (the manual)
+        abbreviations             (an example file to configure journal abbreviations)
+        configuration             (contains user-defined settings)
+        authors                   (author substitutions to e.g. correct Papers BibTeX export)
+        ParseBibTeX.pm            (Perl library for parsing the BibTeX database)
+        DebugPrint.pm             (Perl library required by the script)
+        GetParameters.pm          (Perl library required by the script)
+        PapersToBibTeXformat.scpt (AppleScript to automate the Papers export and script run)
+
+     Do you want to proceed? ("y" to proceed, any other key to abort)
+EOF
+
+$Answer = &ReadKey;
+
+if ($Answer ne "y") { exit 1 }          # abort if answer is not y
+
+if ($Path) {                            # if the user provided a path to install to
+	if ($Path =~ m/^\.\.\//) {           # if the path starts with ../
+		while ($Path =~ m/^\.\.\//) {     # while the path starts with ../
+			chdir "..";                    # move a directory level higher
+			$Path =~ s/^\.\.\///;          # remove the leading ../
+		}
+		
+		$Dir = `pwd`;                     # read the current path (absolute, from root)
+		                                  # this wouldn't work on Windows; use Linux or get a Mac...
+		chomp $Dir;                       # remove the line feed
+		if ($Path) {
+			$Path = $Dir . "/" . $Path;    # add the actual directory to the path
+		}
+	}
+	
+	chdir "$Bin";                           # return to the original path
+}
+else {                                     # if no path was given, use the default
+	$Path = "$ENV{HOME}/bin/bibtexformat";
+}
+
+$Path =~ s/\/$//;                       # remove a trailing slash
+&CheckDir ("$Path");                    # create the target directory, if necessary
+
+################################################################################
+
+# these files are always needed in the current version and are overwritten, if present
+&CopyFile ("bibtexformat", $Path, "overwrite");
+&CopyFile ("bibtexformat.pdf", $Path, "overwrite");
+&CopyFile ("ParseBibTeX.pm", $Path, , "overwrite");
+&CopyFile ("GetParameters.pm", $Path, , "overwrite");
+&CopyFile ("DebugPrint.pm", $Path, "overwrite");
+
+# these files may have been altered by the user in the target directory (in case of an
+# update) and the user is asked, whether a file should be overwritten of not
+&CopyFile ("formatlib", $Path);
+&CopyFile ("authors", $Path);
+&CopyFile ("abbreviations", $Path);
+&CopyFile ("configuration", $Path);
+&CopyFile ("substitutions", $Path);
+&CopyFile ("PapersToBibTeXformat.scpt", $Path);
+
+# make the scripts executable
+chmod 0755, "$Path/bibtexformat";
+chmod 0755, "$Path/formatlib";
+
+print "\n     Installation successful.\n\n";
+
+################################################################################
+
+print <<EOF;
+
+ =>  The folder $Path
+     has to be added to the PATH so that you can execute bibtexformat
+     without stating its full path. You can do that yourself by adding the line
+
+     PATH=\$PATH:$Path
+
+     to the file ~/.profile, ~/.bashrc or ~/.bash_profile
+
+     Should it be done for you? ("y" to proceed, any other key to abort)
+
+EOF
+
+$Answer = &ReadKey;
+
+if ($Answer eq "y") {
+	my $PathAdded = 0;
+	
+	if    (-f "$ENV{HOME}/.profile") {
+		&AddPath ($Path, "$ENV{HOME}/.profile");
+		$PathAdded = 1;
+	}
+	elsif (-f "$ENV{HOME}/.bashrc")  {
+		&AddPath ($Path, "$ENV{HOME}/.bashrc");
+		$PathAdded = 1;
+	}
+	elsif (-f "$ENV{HOME}/.bashrc")  {
+		&AddPath ($Path, "$ENV{HOME}/.bashrc");
+		$PathAdded = 1;
+	}
+	
+	if (not $PathAdded) {
+		# test that the file really does not exist before overwriting/creating it
+		if (not -f "$ENV{HOME}/.profile") {
+			open  FILE, ">$ENV{HOME}/.profile" or die "\nERROR: Could not write $ENV{HOME}/.profile: $!";
+			print FILE "PATH=\$PATH:$Path\n";
+			close FILE;
+			
+			print "     The path has been added to the file ~/.profile.\n";
+		}
+		else {
+			&AddPath ($Path, "$ENV{HOME}/.profile");
+		}
+	}
+	else {
+		print "\n     Done.\n\n";
+	}
+}
+else {
+	print "     Path extension not added to .bashrc or .profile.\n\n";
+}
+
+################################################################################
+
+# read the script's source to check whether the path has to be changed later
+open FILE, "<bibtexformat" or die "\nERROR: Could not read bibtexformat: $!";
+@ScriptContent = <FILE>;
+# strip out the line with the path declaration to the configuration script
+my @Temp = grep /my \$ScriptLocation/, @ScriptContent;
+close FILE;
+
+# read the path declaration
+$ConfigurationPath = shift @Temp;
+# copy everything from after the first quotation mark till the end
+$ConfigurationPath = substr $ConfigurationPath, index ($ConfigurationPath, "\"")+1;
+# copy everything from the beginning till before the next quotation mark
+$ConfigurationPath = substr $ConfigurationPath, 0, index ($ConfigurationPath, "\"");
+# replace $ENV{HOME} in the path declaration with the actual path
+$ConfigurationPath =~ s/\$ENV\{HOME\}/$ENV{HOME}/;
+# remove a trailing slash
+$ConfigurationPath =~ s/\/$//;
+
+# If the path to the configuration file in the script is identical with the target path
+# where the script and, therefore, the configuration file are copied to, then the script
+# itself is simply copied using the copy command. If the path differs, the installation
+# script will try to correct this.
+if ($Path eq $ConfigurationPath) { $ConfigPathOK = 1 }
+                            else { $ConfigPathOK = 0 }
+
+
+if (not $ConfigPathOK) {
+	print "\n";
+	print " =>  The path to the configuration file of the script has to be changed in its\n";
+	print "     source code. The variable \"\$ScriptLocation\" needs its value changed to\n";
+	print "\n";
+	print "     my \$ScriptLocation = \"$Path\";\n";
+	print "\n";
+	print "     Should it be done for you? (\"y\" to proceed, any other key to abort)\n";
+	print "\n";
+	
+	$Answer = &ReadKey;
+	
+	if ($Answer ne "y") {
+		print "\n =>  Fair enough, please remember to update the path yourself.\n\n";
+		exit 1;
+	}
+	else {
+		open FILE, ">$Path/bibtexformat" or die "\nERROR: Could not write $Path/bibtexformat: $!";
+		until (not @ScriptContent or $ScriptContent[0] =~ m/my \$ScriptLocation/) {
+			print FILE shift @ScriptContent;
+		}
+		
+		$Path =~ s/$ENV{HOME}\///;  # replace the explicit path to the home dir with the Perl variable
+		print FILE "my \$ScriptLocation = \"\$ENV{HOME}/$Path\";\n";
+		
+		# shift away the old path definition
+		shift @ScriptContent;
+		
+		# write the rest of the script
+		until (not @ScriptContent) { print FILE shift @ScriptContent; }
+		
+		# make the script executable
+		chmod 0755, "$Path/bibtexformat";
+	}
+}
+
+print " =>  Done. Type \"bibtexformat\" to see the usage information.\n";
+print "     If it was a new installation then you may have to open a new\n";
+print "     terminal session to update the PATH.\n\n";
+
+
+####################################################################################################
+####################################################################################################
+
+
+sub CheckDir { # checks, whether a directory exists and creates it recursively otherwise
+	my $Dir = shift;
+	my (@Fields, $Path, $i, $Slash);
+	
+	if (not -d "$Dir") {
+		print "Creating $Dir ...";
+		
+		if ($Dir =~ m/\//) {
+			@Fields = split "/", $Dir;   # split up the path at the slashes
+			$Path   = "";
+			
+			# if the path was given starting at root (/Users/username/...) then the
+			# first field returned by split is empty and the leading slash is needed
+			if ($Fields[0] eq "") {
+				$Slash  = "/";       # the "root"-slash
+				shift @Fields;       # the empty field created by the leading slash
+			}
+			else { $Slash  = "";  }
+			
+			for $i ( 0 .. $#Fields ) {
+				$Path = $Path . $Slash . $Fields[$i];
+				
+				if (not -d $Path) {
+					mkdir "$Path" or die "\nERROR: Could not create directory $Path: $!";
+				}
+				
+				# this is only needed starting with the second iteration
+				$Slash = "/";
+			}
+		}
+		else {
+			mkdir "$Dir" or die "\nERROR: Could not create directory $Dir: $!";
+		}
+	}
+} # of sub CheckDir
+
+
+####################################################################################################
+
+
+sub CheckFile { # checks, whether a file exists and exits the program otherwise
+	my $File = shift;
+	
+	if (not -f $File) {
+		print "\nERROR: The file $File was not found in the current directory.\n\n";
+		exit 1;
+	}
+} # of sub CheckFile
+
+
+####################################################################################################
+
+
+sub CopyFile { # copies a file but asks whether to overwrite an existing file
+	my $Source    = shift;  # the plain filename in the current directory
+	my $Target    = shift;  # the target directory
+	my $OverWrite = shift;  # if true (any value), the file will be overwritten without asking
+	
+	my $Answer;
+	
+	$Target =~ s/\/$//;  # remove a trailing slash
+	
+	if (-f "$Target/$Source" and not $OverWrite) {
+		print "     $Target/$Source exists. Overwrite?   ";
+		$Answer = &ReadKey (1);
+		if ($Answer ne "y") { print "\n"; return      }
+		               else { print "Overwritten.\n"; }
+	}
+	
+	copy "$Source", "$Target/" or die "\nERROR copying $Source to $Target: $!";
+} # of sub CopyFile
+
+
+####################################################################################################
+
+
+sub AddPath { # adds the new path to the PATH environment variable in .bashrc or .profile
+	my $Path = shift;
+	my $File = shift;
+	
+	print "     Adding path $Path to $File...\n";
+	
+	# read in the complete file
+	open FILE, "<$File" or die "\nERROR: Could not open $File: $!";
+	my @Content = <FILE>;
+	close FILE;
+	
+	# add the new line to the end
+	push @Content, "PATH=\$PATH:$Path\n";
+	
+	# write the file out again
+	open FILE, ">$File" or die "\nERROR: Could not write $File: $!";
+	print FILE join "", @Content;
+	close FILE;
+} # of sub AddPath
+
+
+####################################################################################################
+
+
+sub ReadKey {
+	my $NoNewLine = shift;
+	
+	my $Answer = <STDIN>;
+	chomp $Answer;
+	
+	if (not $NoNewLine) { print "\n"; }
+	
+	return $Answer;
+} # of sub ReadKey
+
+
+####################################################################################################
